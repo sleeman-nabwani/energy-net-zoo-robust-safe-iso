@@ -5,14 +5,17 @@ from stable_baselines3.common.vec_env import VecNormalize
 from pathlib import Path
 from .version_helper import _spaces_from_model_zip, patch_numpy_for_pickle, resolve_algo_class, learning_rate_from_zip
 
+
 def _clip_to_space(x: np.ndarray, action_space) -> np.ndarray:
     """Ensure right dtype/shape and keep the action within Box bounds."""
     x = np.asarray(x, dtype=np.float32).reshape(action_space.shape)
     return np.clip(x, action_space.low, action_space.high)
 
+
 class PCS_Policy(Protocol):
     def __call__(self, obs_pcs:np.ndarray, info:Dict[str, Any], action_space) -> np.ndarray:
         ...
+
 
 class static_Policy(PCS_Policy):
     '''used for establishing a baseline'''
@@ -23,13 +26,15 @@ class static_Policy(PCS_Policy):
         res = np.full(shape=action_space.shape, fill_value=self.value)
         return _clip_to_space(res, action_space)
 
+
 class responsive_Policy(PCS_Policy):
-    def __init__(self, fn: Callable[[np.ndarray, Dict[str, Any]], np.ndarray]):
+    def __init__(self, fn: Callable[[np.ndarray, Dict[str, Any], Any], float | np.ndarray]):
         self.fn = fn
 
     def __call__(self, obs_pcs:np.ndarray, info:Dict[str, Any], action_space) -> np.ndarray:
-        res = self.fn(obs_pcs, info)
-        return _clip_to_space(res, action_space)
+        raw = self.fn(obs_pcs, info, action_space)
+        return _clip_to_space(raw, action_space)
+
 
 class SB3_Policy(PCS_Policy):
     def __init__(self, model_path: str, deterministic: bool = True, device: str = "auto"):

@@ -1,10 +1,6 @@
-# imports (top of safeiso/pcs_policies.py)
 import json, zipfile
 import numpy as np
-try:
-    from gymnasium.spaces import Box
-except Exception:
-    from gym.spaces import Box
+from gymnasium.spaces import Box
 import sys
 from typing import Dict, Any
 from stable_baselines3 import TD3, SAC, PPO, DDPG, A2C, DQN
