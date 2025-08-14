@@ -39,6 +39,11 @@ def _make_iso_cmdp(**kwargs: Any):
 # OmniSafe registration
 # -----------------------------
 
+def _sanitize_tensor(x: torch.Tensor) -> torch.Tensor:
+    # Replace NaN/±Inf and clamp to a large but finite range to keep nets stable
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).clamp_(-1e6, 1e6)
+
+
 @env_register
 class SafeISOOmniEnv(CMDP):
     """Thin adapter to expose SafeISO Gym envs to OmniSafe."""
@@ -96,8 +101,12 @@ class SafeISOOmniEnv(CMDP):
         return getattr(self._env, "render", lambda: None)()
 
     def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[torch.Tensor, dict]:
-        obs, info = self._env.reset(seed=seed, options=options)
+        try:
+            obs, info = self._env.reset(seed=seed, options=options)
+        except TypeError:
+            obs, info = self._env.reset(seed=seed)
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        obs_t = _sanitize_tensor(obs_t)
         return obs_t, info
 
     def step(
@@ -115,15 +124,24 @@ class SafeISOOmniEnv(CMDP):
             obs, reward, terminated, truncated, info = ret
             cost = float(info.get("cost", 0.0))
 
-        # Ensure info['cost'] is consistent and present for both modes
+        # Ensure info['cost'] is consistent and finite
         if not isinstance(info, dict):
             info = dict(info)
         info = dict(info)
-        info["cost"] = float(cost)
+        c = float(cost)
+        if not np.isfinite(c):
+            c = 0.0
+        # Optional clamp to plausible range [0, 1]
+        if c < 0.0:
+            c = 0.0
+        elif c > 1.0:
+            c = 1.0
+        info["cost"] = c
 
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+        obs_t = _sanitize_tensor(obs_t)
         rew_t = torch.tensor(reward, dtype=torch.float32, device=self._device)
-        cost_t = torch.tensor(float(cost), dtype=torch.float32, device=self._device)
+        cost_t = torch.tensor(c, dtype=torch.float32, device=self._device)
         term_t = torch.tensor(bool(terminated), dtype=torch.bool, device=self._device)
         trunc_t = torch.tensor(bool(truncated), dtype=torch.bool, device=self._device)
         return obs_t, rew_t, cost_t, term_t, trunc_t, info

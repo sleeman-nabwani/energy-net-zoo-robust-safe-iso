@@ -283,11 +283,22 @@ class CMDPAdapter(gym.Wrapper):
 
         # hard constraints
         hard_trigger: Optional[str] = None
+        vio_shortfall = int(shortfall_mw > 0.0) if self.cfg.hard_shortfall else 0
+        vio_reserve = 0
+        vio_neg_spread = 0
+        # Compute reserve inadequacy boolean
+        margin_mw = cap_mw - max(0.0, net_demand_mw)
+        need_mw = self.cfg.reserve_min_frac * max(0.0, net_demand_mw)
+        if self.cfg.hard_reserve_adequacy and (margin_mw < need_mw):
+            vio_reserve = 1
+        if self.cfg.hard_negative_spread and (sell_price < buy_price):
+            vio_neg_spread = 1
+        # Frequency hard band violation
+        vio_freq_hard = int((next_f_hz < self.vf.freq_hard_low_hz) or (next_f_hz > self.vf.freq_hard_high_hz))
+
         if self.cfg.hard_shortfall and shortfall_mw > 0.0:
             hard_trigger = 'shortfall>0'
         if hard_trigger is None and self.cfg.hard_reserve_adequacy:
-            margin_mw = cap_mw - max(0.0, net_demand_mw)
-            need_mw = self.cfg.reserve_min_frac * max(0.0, net_demand_mw)
             if margin_mw < need_mw:
                 hard_trigger = 'reserve_inadequate'
         if hard_trigger is None and self.cfg.hard_negative_spread and (sell_price < buy_price):
@@ -295,6 +306,16 @@ class CMDPAdapter(gym.Wrapper):
         if hard_trigger is None:
             if (next_f_hz < self.vf.freq_hard_low_hz) or (next_f_hz > self.vf.freq_hard_high_hz):
                 hard_trigger = 'freq_hard_band'
+
+        # Prepare violations dictionary for info
+        violations = {
+            'shortfall': vio_shortfall,
+            'reserve': vio_reserve,
+            'freq_oob': vio_freq_hard,
+        }
+        if self.cfg.hard_negative_spread:
+            violations['negative_spread'] = vio_neg_spread
+        violation_types = [k for k, v in violations.items() if v]
 
         if hard_trigger is not None:
             cost = 1.0
@@ -314,6 +335,8 @@ class CMDPAdapter(gym.Wrapper):
                     'dispatch_cap_mw': float(cap_mw),
                 },
             )
+            info['violations'] = violations
+            info['violation_types'] = violation_types
             # state update
             self._prev_dispatch_mw = dispatch_mw
             self._prev_batt_mw = batt_mw
@@ -368,6 +391,8 @@ class CMDPAdapter(gym.Wrapper):
                 'dispatch_cap_mw': float(cap_mw),
             },
         )
+        info['violations'] = violations
+        info['violation_types'] = violation_types
 
         # state update
         self._prev_dispatch_mw = dispatch_mw
