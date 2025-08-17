@@ -9,6 +9,15 @@ set -euo pipefail
 
 ROOT="/home/sleemann/energy-net-zoo-robust-safe-iso"
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT"
+CONDA_ENV="${CONDA_ENV:-energy-net-zoo}"
+
+# Build a python command as an array to support conda run with args
+PYTHON_CMD=(python3)
+if [[ -x "/home/sleemann/miniconda3/bin/conda" ]]; then
+  PYTHON_CMD=("/home/sleemann/miniconda3/bin/conda" run -n "${CONDA_ENV}" python)
+elif command -v conda >/dev/null 2>&1; then
+  PYTHON_CMD=(conda run -n "${CONDA_ENV}" python)
+fi
 
 STEPS="${STEPS:-96}"
 HORIZON="${HORIZON:-48}"
@@ -34,7 +43,7 @@ ALGOS=(PPOLag CUP CPO FOCOPS SautePPO)
 for ALGO in "${ALGOS[@]}"; do
   SAVE_DIR="$ROOT/runs/smoke_${ALGO}_${TAG}_${EVAL_MODE}"
   echo "== $ALGO ($TAG) eval_mode=$EVAL_MODE =="
-  python -m safeiso.train.train_omnisafe \
+  "${PYTHON_CMD[@]}" -m safeiso.train.train_omnisafe \
     --algo "$ALGO" \
     --steps "$STEPS" \
     --seed "$SEED" \
