@@ -112,8 +112,8 @@ def export_evalpack(
     elif obs_mean_list is not None:
         obs_dim = len(obs_mean_list)
     else:
-        # Fallback for SafeISO which typically has 3D obs (frequency, voltage, reserves)
-        obs_dim = 3
+        # Fallback: SautePPO augments obs with safety budget (4D), others use base SafeISO (3D)
+        obs_dim = 4 if algo.lower() == 'sauteppo' else 3
     
     # Create example input for tracing
     actor = actor.cpu().eval()

@@ -169,6 +169,16 @@ def run_suite(
                     obs, rew, terminated, truncated, info = step
                     cost = float(info.get("cost", 0.0))
                 
+                # Debug prints for first steps
+                if args.debug and t < 5:
+                    # robust access for both list/tuple or dict info
+                    ii = info[0] if isinstance(info, (list, tuple)) else info
+                    pcs_a = ii.get('pcs_action', 'NA')
+                    vio = ii.get('violations', {})
+                    rbc = ii.get('raw_cost_before_clip', 'NA')
+                    cst = float(cost if not hasattr(cost, 'item') else cost.item())
+                    print(f"[debug ep{e} t{t}] pcs_action={pcs_a} shortfall={vio.get('shortfall')} freq_oob={vio.get('freq_oob')} raw_before_clip={rbc} cost={cst}")
+                
                 # sauté update: s_{t+1} = (s_t - cost_t) / gamma
                 if is_saute:
                     try:
@@ -240,6 +250,7 @@ def main():
     ap.add_argument("--cost_limit", type=float, default=0.10)
     ap.add_argument("--out_scenarios", default=None)
     ap.add_argument("--out_episodes", default=None)
+    ap.add_argument("--debug", action="store_true", help="Print first steps diagnostics per episode")
     args = ap.parse_args()
 
     # Default outputs under run_dir/eval/...

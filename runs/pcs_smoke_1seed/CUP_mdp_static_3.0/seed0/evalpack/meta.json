@@ -1,0 +1,19 @@
+{
+  "format_version": 1,
+  "algo": "CUP",
+  "env_id": "SafeISO-ISOOnly-omni-v0",
+  "seed": 0,
+  "obs_norm": null,
+  "action_space": {
+    "low": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "high": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  }
+}

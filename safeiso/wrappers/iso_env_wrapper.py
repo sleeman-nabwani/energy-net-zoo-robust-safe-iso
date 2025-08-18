@@ -57,6 +57,12 @@ class IsoEnvWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(joint_action)
         self._last_obs, self._last_info = obs, info
 
+        # Add PCS action to info for diagnostics
+        if isinstance(pcs_action, np.ndarray) and pcs_action.size == 1:
+            info['pcs_action'] = float(pcs_action.flat[0])
+        elif isinstance(pcs_action, (int, float)):
+            info['pcs_action'] = float(pcs_action)
+
         r_iso = float(reward.get("iso", reward) if isinstance(reward, dict) else reward)
         te = bool(terminated.get("iso", terminated) if isinstance(terminated, dict) else terminated)
         tr = bool(truncated.get("iso", truncated) if isinstance(truncated, dict) else truncated)

@@ -1,0 +1,10 @@
+scenarios:
+  - name: "static_zero"
+    preset: "default"
+    pcs_spec: "static:0.0"
+  - name: "static_generous"  
+    preset: "default"
+    pcs_spec: "static:5.0"
+  - name: "responsive_generous"
+    preset: "default"
+    pcs_spec: "responsive:spread_prop?gain=1.0&clip=15"

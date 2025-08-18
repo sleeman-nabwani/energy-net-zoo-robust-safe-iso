@@ -1,0 +1,14 @@
+scenarios:
+  - preset: default
+    pcs: "static:0.0"
+    episodes: 4
+    tags: [static, stress]
+  - preset: default
+    pcs: "static:3.0"
+    episodes: 4
+    tags: [static]
+  - preset: default
+    pcs: "responsive:spread_prop?gain=0.6&clip=5"
+    episodes: 4
+    tags: [responsive]
+
