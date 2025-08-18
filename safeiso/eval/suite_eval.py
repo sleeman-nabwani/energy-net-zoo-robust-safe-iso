@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, csv, dataclasses, glob, math, os, re
+import argparse, csv, dataclasses, glob, math, os, re, json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Tuple, List
 
@@ -25,9 +25,9 @@ from safeiso.eval.evalpack_loader import load_evalpack
 
 
 # OmniSafe Evaluator loader
-def _load_evalpack_policy(run_dir: str) -> Callable:
-    act, _ = load_evalpack(run_dir)
-    return act
+def _load_evalpack_policy(run_dir: str) -> Tuple[Callable, Dict[str, Any]]:
+    act, meta = load_evalpack(run_dir)
+    return act, meta
 
 
 # PCS env builder (use unified PCS spec)
@@ -109,10 +109,18 @@ def run_suite(
         # ISO policy tied to this env's action space
         if policy == "mean":
             iso_act = lambda obs, deterministic=True: ((env.action_space.low + env.action_space.high)/2.0).astype(np.float32)  # noqa: E731
+            meta = {}
         elif policy == "random":
             iso_act = lambda obs, deterministic=True: env.action_space.sample().astype(np.float32)  # noqa: E731
+            meta = {}
         else:
-            iso_act = _load_evalpack_policy(policy)
+            iso_act, meta = _load_evalpack_policy(policy)
+
+        # Resolve Sauté flags/params
+        is_saute = ("saute" in str(algo).lower()) or (isinstance(meta, dict) and "saute" in meta)
+        saute_cfg = (meta.get("saute", {}) if isinstance(meta, dict) else {}) if is_saute else {}
+        saute_gamma = float(saute_cfg.get("gamma", 1.0))
+        safety_budget = saute_cfg.get("budget", None)  # if None, fallback to cost_limit*horizon later
 
         # episode loop
         ret_list, costs_all = [], []
@@ -120,17 +128,58 @@ def run_suite(
         for e in range(eps):
             obs, info = env.reset(seed=base_seed + i + e)
             ep_ret = 0.0; ep_costs = []; sh=fq=rv=0
+            
+            # init sauté safety state once per episode
+            if is_saute:
+                s = float(safety_budget if safety_budget is not None else (cost_limit * horizon))
+            
             for t in range(horizon):
-                a = iso_act(obs, True)
-                step = env.step(a)
+                ob = obs
+                # to numpy on CPU
+                if not isinstance(ob, np.ndarray):
+                    try:
+                        ob = ob.detach().cpu().numpy()
+                    except Exception:
+                        ob = np.asarray(ob, dtype=np.float32)
+                if ob.ndim == 2 and ob.shape[0] == 1:
+                    ob = ob[0]
+
+                # augment if sauté
+                if is_saute:
+                    ob_aug = np.concatenate([ob.astype(np.float32, copy=False),
+                                           np.array([s], dtype=np.float32)], axis=0)
+                else:
+                    ob_aug = ob.astype(np.float32, copy=False)
+
+                a = iso_act(ob_aug, True)
+                
+                # step
+                a_t = a
+                try:
+                    import torch
+                    if isinstance(obs, torch.Tensor) and not isinstance(a, torch.Tensor):
+                        a_t = torch.as_tensor(a, dtype=torch.float32, device=obs.device)
+                except Exception:
+                    pass
+                
+                step = env.step(a_t)
                 if len(step) == 6:
                     obs, rew, cost, terminated, truncated, info = step
                 else:
                     obs, rew, terminated, truncated, info = step
                     cost = float(info.get("cost", 0.0))
+                
+                # sauté update: s_{t+1} = (s_t - cost_t) / gamma
+                if is_saute:
+                    try:
+                        c_val = float(cost) if not hasattr(cost, "item") else float(cost.item())
+                    except Exception:
+                        c_val = float(info.get("cost", 0.0)) if isinstance(info, dict) else 0.0
+                    s = (s - c_val) / max(1e-12, saute_gamma)
+                
                 ep_ret += float(rew)
                 c = float(cost); ep_costs.append(c)
-                s,f,r = _count_flags(info); sh+=s; fq+=f; rv+=r
+                s_count,f_count,r_count = _count_flags(info); sh+=s_count; fq+=f_count; rv+=r_count
                 if terminated or truncated:
                     break
             ret_list.append(ep_ret); costs_all.extend(ep_costs)
@@ -189,15 +238,30 @@ def main():
     ap.add_argument("--mode", default="CMDP")  # CMDP|ISOOnly
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--cost_limit", type=float, default=0.10)
-    ap.add_argument("--out_scenarios", default="stress_eval.csv")
-    ap.add_argument("--out_episodes", default="stress_eval_episodes.csv")
+    ap.add_argument("--out_scenarios", default=None)
+    ap.add_argument("--out_episodes", default=None)
     args = ap.parse_args()
+
+    # Default outputs under run_dir/eval/...
+    out_scenarios = args.out_scenarios
+    out_episodes = args.out_episodes
+    if out_scenarios is None and isinstance(args.policy, str) and os.path.isdir(os.path.join(args.policy, "evalpack")):
+        os.makedirs(os.path.join(args.policy, "eval"), exist_ok=True)
+        out_scenarios = os.path.join(args.policy, "eval", "stress_eval.csv")
+    if out_episodes is None and isinstance(args.policy, str) and os.path.isdir(os.path.join(args.policy, "evalpack")):
+        out_episodes = os.path.join(args.policy, "eval", "stress_eval_episodes.csv")
+    
+    # Fallback defaults
+    if out_scenarios is None:
+        out_scenarios = "stress_eval.csv"
+    if out_episodes is None:
+        out_episodes = "stress_eval_episodes.csv"
 
     run_suite(
         env_id=args.env_id, suite_path=args.suite, policy=args.policy,
         episodes=args.episodes, horizon=args.horizon, base_seed=args.seed,
         algo=args.algo, mode=args.mode, device=args.device, cost_limit=args.cost_limit,
-        out_scenarios=args.out_scenarios, out_episodes=args.out_episodes,
+        out_scenarios=out_scenarios, out_episodes=out_episodes,
     )
 
 if __name__ == "__main__":
