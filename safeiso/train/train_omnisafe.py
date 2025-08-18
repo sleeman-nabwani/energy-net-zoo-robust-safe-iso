@@ -265,6 +265,7 @@ def main():
         export_evalpack(
             actor=actor,
             action_space=export_env.action_space,
+            observation_space=export_env.observation_space,
             run_dir=args.save_dir,
             algo=args.algo,
             env_id=env_id,

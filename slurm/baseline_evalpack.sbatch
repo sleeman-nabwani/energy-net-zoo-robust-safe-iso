@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --array=0-29%4
 
-set -euo pipefail
+set -e
 
 CONDA_ENV="${CONDA_ENV:-energy-net-zoo}"
 SAVE_ROOT="${SAVE_ROOT:-runs/baseline_static}"

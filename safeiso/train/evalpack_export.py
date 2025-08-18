@@ -60,13 +60,23 @@ class _EvalWrapper(torch.nn.Module):
         x = obs if obs.ndim > 1 else obs.unsqueeze(0)
         if self.mean is not None and self.var is not None:
             x = (x - self.mean) / torch.sqrt(self.var + self.eps)
-        out = self.actor(x)
-        if hasattr(out, "mean") and hasattr(out, "rsample"):
+        
+        # Get raw output from actor and handle distributions
+        with torch.no_grad():
+            out = self.actor(x)
+        
+        # Extract action from various output types
+        if hasattr(out, "mean"):
             act = out.mean
         elif isinstance(out, (tuple, list)):
-            act = out[0]
+            act = out[0]  
         else:
             act = out
+        
+        # Ensure proper shape and clamp
+        if act.ndim == 1 and x.ndim > 1:
+            act = act.unsqueeze(0)
+        
         return torch.clamp(act, self.low, self.high)
 
 
@@ -74,6 +84,7 @@ def export_evalpack(
     *,
     actor: torch.nn.Module,
     action_space,  # gymnasium.spaces.Box
+    observation_space=None,  # gymnasium.spaces.Box
     run_dir: str | Path,
     algo: str,
     env_id: str,
@@ -95,17 +106,42 @@ def export_evalpack(
     obs_mean_list = _to_pylist(obs_mean)
     obs_var_list = _to_pylist(obs_var)
 
-    # Script the wrapper
+    # Determine observation dimensionality
+    if observation_space is not None and hasattr(observation_space, 'shape'):
+        obs_dim = observation_space.shape[0]
+    elif obs_mean_list is not None:
+        obs_dim = len(obs_mean_list)
+    else:
+        # Fallback for SafeISO which typically has 3D obs (frequency, voltage, reserves)
+        obs_dim = 3
+    
+    # Create example input for tracing
+    actor = actor.cpu().eval()
+    dummy_obs = torch.randn(1, obs_dim, dtype=torch.float32)
+    
+    # Test the actor and extract mean action
+    with torch.no_grad():
+        actor_out = actor(dummy_obs)
+        if hasattr(actor_out, "mean"):
+            example_action = actor_out.mean
+        elif isinstance(actor_out, (tuple, list)):
+            example_action = actor_out[0]
+        else:
+            example_action = actor_out
+    
+    # Create wrapper and trace it
     wrapper = _EvalWrapper(
-        actor=actor.cpu(),
+        actor=actor,
         low=low,
         high=high,
         obs_mean=obs_mean_list,
         obs_var=obs_var_list,
         eps=float(eps),
     )
-    scripted = torch.jit.script(wrapper)
-    scripted.save(str(out_dir / "actor.ts"))
+    
+    # Use tracing instead of scripting to avoid annotation issues
+    traced = torch.jit.trace(wrapper, dummy_obs)
+    traced.save(str(out_dir / "actor.ts"))
 
     # Build JSON-serializable meta; DO NOT .tolist() lists again
     meta = {
