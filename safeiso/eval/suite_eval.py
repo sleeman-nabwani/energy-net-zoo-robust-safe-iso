@@ -84,6 +84,7 @@ def run_suite(
     verbose: bool = True,
     print_prompt: bool = True,
     dry_run: bool = False,
+    debug: bool = False,
 ):
     with open(suite_path, "r") as f:
         suite = yaml.safe_load(f)
@@ -169,8 +170,8 @@ def run_suite(
                     obs, rew, terminated, truncated, info = step
                     cost = float(info.get("cost", 0.0))
                 
-                # Debug prints for first steps
-                if args.debug and t < 5:
+                # Debug prints for first few steps
+                if debug and t < 5:
                     # robust access for both list/tuple or dict info
                     ii = info[0] if isinstance(info, (list, tuple)) else info
                     pcs_a = ii.get('pcs_action', 'NA')
@@ -238,7 +239,10 @@ def run_suite(
 # CLI
 def main():
     ap = argparse.ArgumentParser(description="Evaluate ONE policy against a scenario suite (deterministic).")
-    ap.add_argument("--env_id", default="SafeISO-CMDP-omni-v0")
+    ap.add_argument("--env_id", default="SafeISO-CMDP-omni-v0", 
+                   help="(Deprecated) training env id hint; not used for scoring.")
+    ap.add_argument("--metric_env_id", default="SafeISO-CMDP-omni-v0",
+                   help="Env used to compute reward/cost metrics for ALL policies.")
     ap.add_argument("--suite", required=True)
     ap.add_argument("--policy", required=True)  # 'mean'|/path/to/run_dir
     ap.add_argument("--episodes", type=int, default=8)
@@ -269,10 +273,11 @@ def main():
         out_episodes = "stress_eval_episodes.csv"
 
     run_suite(
-        env_id=args.env_id, suite_path=args.suite, policy=args.policy,
+        env_id=args.metric_env_id, suite_path=args.suite, policy=args.policy,
         episodes=args.episodes, horizon=args.horizon, base_seed=args.seed,
         algo=args.algo, mode=args.mode, device=args.device, cost_limit=args.cost_limit,
         out_scenarios=out_scenarios, out_episodes=out_episodes,
+        debug=args.debug,
     )
 
 if __name__ == "__main__":

@@ -48,6 +48,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--cost_limit", type=float, default=0.10)
+    ap.add_argument("--metric_env_id", default="SafeISO-CMDP-omni-v0", help="Env used for ALL metric computation")
     ap.add_argument("--overwrite", action="store_true", help="Recompute even if eval CSVs exist")
     # Logging controls
     ap.add_argument("--verbose", action="store_true", help="Verbose logging")
@@ -70,7 +71,8 @@ def main():
     failed = []
     for run_dir in targets:
         algo, mode = infer_algo_mode(run_dir)
-        env_id = "SafeISO-CMDP-omni-v0" if mode == "CMDP" else "SafeISO-ISOOnly-omni-v0"
+        # Always use the unified metric env for scoring
+        env_id = args.metric_env_id
 
         out_dir = os.path.join(run_dir, "eval")
         os.makedirs(out_dir, exist_ok=True)

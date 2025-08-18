@@ -337,14 +337,6 @@ class CMDPAdapter(gym.Wrapper):
             )
             info['violations'] = violations
             info['violation_types'] = violation_types
-            
-            # Diagnostic fields for hard trigger case too
-            info['raw_cost_before_clip'] = 1.0  # Hard triggers set cost to 1.0 directly
-            if 'pcs_action' not in info:
-                try:
-                    info['pcs_action'] = float(getattr(self, 'last_pcs_action', 0.0))
-                except Exception:
-                    pass
             # state update
             self._prev_dispatch_mw = dispatch_mw
             self._prev_batt_mw = batt_mw
@@ -379,11 +371,13 @@ class CMDPAdapter(gym.Wrapper):
             'spread': self.cfg.w_spread,
         }
 
-        raw_cost = weighted_sum_cost(comps, weights)
+        # Store raw cost before any potential clipping (for diagnostics)
+        raw_cost_before_clip = 0.0
+        for name, pen in comps.items():
+            w = float(weights.get(name, 0.0))
+            raw_cost_before_clip += w * float(pen)
         
-        # Keep a copy of the pre-clip value for diagnostics
-        raw_cost_before_clip = float(raw_cost)
-        cost = np.clip(raw_cost, 0.0, 1.0).astype(np.float32)
+        cost = weighted_sum_cost(comps, weights)
 
         # attach debug
         info = self._attach_debug(
@@ -403,23 +397,10 @@ class CMDPAdapter(gym.Wrapper):
                 'dispatch_cap_mw': float(cap_mw),
             },
         )
-        
-        # Ensure violation flags exist (booleans) - already computed above
-        vio = info.get('violations', {})
-        vio.setdefault('shortfall', bool(vio_shortfall))
-        vio.setdefault('freq_oob', bool(vio_freq_hard))  
-        vio.setdefault('reserve_violation', bool(vio_reserve))
-        info['violations'] = vio
+        # Add diagnostic fields
+        info['raw_cost_before_clip'] = float(raw_cost_before_clip)
+        info['violations'] = violations
         info['violation_types'] = violation_types
-        
-        # Diagnostic fields
-        info['raw_cost_before_clip'] = raw_cost_before_clip
-        # pcs_action: the scalar actually used by the env this step (if available)
-        if 'pcs_action' not in info:
-            try:
-                info['pcs_action'] = float(getattr(self, 'last_pcs_action', 0.0))
-            except Exception:
-                pass
 
         # state update
         self._prev_dispatch_mw = dispatch_mw
