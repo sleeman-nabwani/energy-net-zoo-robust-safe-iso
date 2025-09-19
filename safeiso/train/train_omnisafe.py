@@ -1,13 +1,8 @@
-# safeiso/train/train_omnisafe.py
 """
 OmniSafe trainer for SafeISO.
-
 Assumptions:
-- Env IDs are registered by importing safeiso.utils.register_envs.
-- OmniSafe always returns a 6-tuple: (obs, reward, cost, terminated, truncated, info).
 - PCS policy is passed as a single string spec via --pcs (e.g. 'static:0.0',
   'sb3:/abs/model.zip', 'responsive:spread_prop?gain=0.6&clip=5').
-
 Example:
   python -m safeiso.train.train_omnisafe \
     --algo PPOLag --steps 2000 --seed 0 --device cpu \
@@ -23,6 +18,9 @@ import numpy as np
 
 # Ensure SafeISO env IDs are registered
 import safeiso.utils.register_envs  # noqa: F401
+from safeiso.utils.logging_config import get_logger
+
+logger = get_logger("train.train_omnisafe")
 
 from omnisafe.envs import make as omni_make
 from omnisafe.utils.config import Config
@@ -30,6 +28,7 @@ from omnisafe.utils.config import Config
 from safeiso.train.algo_defaults import BASE, deep_update, algo_overrides, validate_required
 from safeiso.eval.metrics import rollout_metrics
 from safeiso.eval.policy_api import make_policy_act
+from safeiso.train.evalpack_export import export_evalpack
 
 ALGOS = ("PPOLag", "CUP", "CPO", "SautePPO", "FOCOPS")
 
@@ -172,13 +171,13 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    print(json.dumps({
+    logger.info(json.dumps({
         "algo": args.algo, "cmdp": args.cmdp, "steps": args.steps,
         "seed": args.seed, "device": args.device, "pcs": args.pcs,
         "preset": args.preset, "cost_limit": args.cost_limit,
         "eval_every": args.eval_every, "eval_episodes": args.eval_episodes,
         "save_dir": args.save_dir
-    }, indent=2), flush=True)
+    }, indent=2))
 
     env_id = build_env_id(args)
     Algo = get_algo_class(args.algo)
@@ -210,11 +209,10 @@ def main():
 
     # Eval
     if args.eval_mode != "none":
-        # For SautePPO, the policy expects safety-augmented observations provided by the Saute adapter.
-        # Use the agent's wrapped env to avoid observation-dimension mismatch.
-        if args.algo in ("SautePPO", "PPOSaute"):
-            eval_env = getattr(agent, "_env", None)
-        else:
+        # Use the agent's wrapped env for evaluation to ensure identical wrappers
+        # (normalization, safety augmentation, vectorization) and avoid shape/device mismatches.
+        eval_env = getattr(agent, "_env", None)
+        if eval_env is None:
             eval_env = omni_make(
                 env_id,
                 num_envs=1,
@@ -231,10 +229,10 @@ def main():
             try:
                 policy_act = make_policy_act(agent)
             except Exception as e:
-                print(f"[eval] policy mode unavailable, falling back to random: {e!r}")
+                logger.warning(f"[eval] policy mode unavailable, falling back to random: {e!r}")
                 policy_act = None
         metrics = rollout_metrics(eval_env, episodes=args.eval_episodes, policy_act=policy_act, deterministic=True)
-        print(json.dumps({
+        logger.info(json.dumps({
             "eval_reward_mean": metrics["reward_mean"],
             "eval_cost_avg_mean": metrics["avg_step_cost_mean"],
             "eval_ep_len_mean": metrics["ep_len_mean"],
@@ -243,6 +241,48 @@ def main():
             "eval_steps_total": metrics["steps_total"],
             "eval_mode": args.eval_mode,
         }, indent=2))
+
+    # EvalPack export (deterministic, version-agnostic)
+    try:
+        ac = getattr(agent, "_actor_critic", None)
+        actor = getattr(ac, "actor", None)
+        if actor is None:
+            raise RuntimeError("Actor not found on agent; cannot export EvalPack.")
+        # Obtain action space from a compatible env instance
+        export_env = getattr(agent, "_env", None)
+        close_after = False
+        if export_env is None:
+            export_env = omni_make(
+                env_id,
+                num_envs=1,
+                device="cpu",
+                seed=args.seed,
+                pcs=args.pcs,
+                preset=args.preset,
+                spread_limit=args.spread_limit,
+                return_cost_in_info=args.return_cost_in_info,
+                max_episode_steps=args.max_episode_steps,
+            )
+            close_after = True
+        obs_rms = getattr(agent, "obs_rms", None)
+        export_evalpack(
+            actor=actor,
+            action_space=export_env.action_space,
+            observation_space=export_env.observation_space,
+            run_dir=args.save_dir,
+            algo=args.algo,
+            env_id=env_id,
+            seed=int(args.seed),
+            obs_rms=obs_rms,
+        )
+        if close_after:
+            try:
+                export_env.close()
+            except Exception:
+                pass
+        logger.info(f"[EvalPack] Exported at: {os.path.join(args.save_dir, 'evalpack')}")
+    except Exception as e:
+        logger.error(f"[EvalPack] Export failed: {e}")
 
 
 if __name__ == "__main__":

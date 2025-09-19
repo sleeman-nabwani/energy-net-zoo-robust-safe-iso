@@ -4,7 +4,7 @@
 - Registers OmniSafe IDs only (no Gym ID registration)
 """
 
-from typing import Any, ClassVar, Tuple
+from typing import Any, ClassVar, Tuple, Optional, Union, List
 
 import numpy as np
 import torch
@@ -48,7 +48,7 @@ def _sanitize_tensor(x: torch.Tensor) -> torch.Tensor:
 class SafeISOOmniEnv(CMDP):
     """Thin adapter to expose SafeISO Gym envs to OmniSafe."""
 
-    _support_envs: ClassVar[list[str]] = [
+    _support_envs: ClassVar[List[str]] = [
         "SafeISO-ISOOnly-omni-v0",
         "SafeISO-CMDP-omni-v0",
     ]
@@ -91,7 +91,7 @@ class SafeISOOmniEnv(CMDP):
         return self._observation_space
 
     @property
-    def max_episode_steps(self) -> int | None:
+    def max_episode_steps(self) -> Optional[int]:
         return self._max_episode_steps
 
     def set_seed(self, seed: int) -> None:
@@ -100,7 +100,7 @@ class SafeISOOmniEnv(CMDP):
     def render(self):
         return getattr(self._env, "render", lambda: None)()
 
-    def reset(self, *, seed: int | None = None, options: dict | None = None) -> Tuple[torch.Tensor, dict]:
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None) -> Tuple[torch.Tensor, dict]:
         try:
             obs, info = self._env.reset(seed=seed, options=options)
         except TypeError:
@@ -110,7 +110,7 @@ class SafeISOOmniEnv(CMDP):
         return obs_t, info
 
     def step(
-        self, action: torch.Tensor | np.ndarray
+        self, action: Union[torch.Tensor, np.ndarray]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         if isinstance(action, torch.Tensor):
             act = action.detach().to("cpu").contiguous().numpy().astype(np.float32, copy=False)
@@ -137,10 +137,22 @@ class SafeISOOmniEnv(CMDP):
         elif c > 1.0:
             c = 1.0
         info["cost"] = c
+        
+        # CRITICAL FIX: Scale rewards to prevent critic loss explosion
+        # EnergyNet rewards are ~-1.57M per episode, causing loss explosion in OmniSafe
+        # Scale by 1e6 to bring rewards to reasonable range (~-1.57 per episode)
+        # This preserves relative magnitudes while preventing numerical instability
+        scaled_reward = float(reward) / 1e6
+        
+        # Store original reward and scaling information for debugging
+        # Note: Keep these as metadata only - don't include 'original_reward' 
+        # as OmniSafe may try to use it in its internal calculations
+        info["reward_scale_factor"] = 1e6
+        info["unscaled_reward"] = float(reward)
 
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
         obs_t = _sanitize_tensor(obs_t)
-        rew_t = torch.tensor(reward, dtype=torch.float32, device=self._device)
+        rew_t = torch.tensor(scaled_reward, dtype=torch.float32, device=self._device)
         cost_t = torch.tensor(c, dtype=torch.float32, device=self._device)
         term_t = torch.tensor(bool(terminated), dtype=torch.bool, device=self._device)
         trunc_t = torch.tensor(bool(truncated), dtype=torch.bool, device=self._device)

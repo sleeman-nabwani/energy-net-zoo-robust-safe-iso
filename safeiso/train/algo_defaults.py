@@ -68,10 +68,107 @@ REQ_BY_ALGO = {
 
 
 def algo_overrides(name: str, *, horizon: int, cost_limit: float) -> Dict[str, Any]:
+    # PPOLag: Add robust configuration for Lagrangian methods to prevent NaN errors
+    if name == "PPOLag":
+        # Special handling for very short training runs (< 100 steps)
+        if horizon < 100:
+            return {
+                "algo_cfgs": {
+                    # Ultra-conservative settings for short runs
+                    "lagrange_init": 0.0,        # Start with zero multiplier
+                    "lagrange_lr": 0.0,          # Disable learning entirely for very short runs
+                    "lagrange_max": 0.1,         # Very low maximum value
+                    "cost_limit": 1.0,           # Very relaxed limit
+                    "use_cost": False,           # Disable cost constraint entirely
+                    
+                    # Minimal updates to prevent NaN
+                    "update_epochs": 1,          # Single update epoch
+                    "batch_size": max(32, horizon),  # Small batch size
+                    "clip": 0.5,                 # Large clipping for stability
+                    "target_kl": 0.1,           # High KL tolerance
+                    
+                    # Disable problematic features
+                    "cost_normalize": False,     # Skip normalization for short runs
+                    "obs_normalize": False,      # Skip observation normalization
+                    "reward_normalize": False,   # Skip reward normalization
+                },
+                "lagrange_cfgs": {
+                    "cost_limit": 1.0,
+                    "lagrangian_multiplier_init": 0.0,
+                    "lambda_lr": 0.0,            # Disable lambda learning
+                    "lagrangian_upper_bound": 0.1,
+                }
+            }
+        else:
+            return {
+                "algo_cfgs": {
+                    # Standard robust configuration for normal runs
+                    "lagrange_init": 0.001,      # Start with very small multiplier
+                    "lagrange_lr": 0.0001,       # Conservative learning rate
+                    "lagrange_max": 10.0,        # Cap maximum value
+                    
+                    # Cost normalization for numerical stability
+                    "cost_normalize": True,       # Critical for preventing NaN
+                    "cost_gamma": 0.99,          # Discount for cost advantages
+                    
+                    # Training stability improvements
+                    "update_epochs": min(8, max(3, horizon // 2000)),  # Adaptive update epochs
+                    "batch_size": min(1024, max(64, horizon // 4)),    # Adaptive batch size
+                    "clip": 0.2,                 # Standard clipping
+                    "target_kl": 0.02,          # Slightly higher for robustness
+                    
+                    # Normalization settings
+                    "obs_normalize": True,       # Essential for stability
+                    "reward_normalize": False,   # Keep rewards unnormalized
+                },
+                "lagrange_cfgs": {
+                    "cost_limit": float(cost_limit),
+                    "lagrangian_multiplier_init": 0.001,
+                    "lambda_lr": 0.0001,
+                    "lagrangian_upper_bound": 10.0,
+                }
+            }
+    
     if name == "FOCOPS":
-        return {"algo_cfgs": {"focops_eta": 0.02, "focops_lam": 1.0}}
+        return {
+            "algo_cfgs": {
+                "focops_eta": 0.02, 
+                "focops_lam": 1.0,
+                # Add stability improvements
+                "cost_normalize": True,
+                "obs_normalize": True,
+            },
+            "lagrange_cfgs": {
+                "cost_limit": float(cost_limit),
+                "lagrangian_multiplier_init": 0.0,
+                "lambda_lr": 0.005,
+            }
+        }
+    
     if name == "CPO":
-        return {"algo_cfgs": {"cg_iters": 10, "cg_damping": 0.1, "fvp_sample_freq": 1}}
+        return {
+            "algo_cfgs": {
+                "cg_iters": 10, 
+                "cg_damping": 0.1, 
+                "fvp_sample_freq": 1,
+                # Add CPO-specific stability settings
+                "target_kl": 0.02,          # Slightly higher for robustness
+                "cost_normalize": True,     # Normalize cost values
+                "obs_normalize": True,      # Observation normalization
+            }
+        }
+    
+    if name == "CUP":
+        return {
+            "algo_cfgs": {
+                # CUP-specific settings for stability
+                "cost_normalize": True,      # Normalize cost statistics
+                "obs_normalize": True,       # Observation normalization
+                "target_kl": 0.02,          # Conservative KL target
+                "clip": 0.2,                # Standard clipping
+            }
+        }
+    
     if name in ("SautePPO", "PPOSaute"):
         budget = float(cost_limit) * int(horizon)
         return {
@@ -88,6 +185,7 @@ def algo_overrides(name: str, *, horizon: int, cost_limit: float) -> Dict[str, A
             # optional mirror for adapter variants; harmless if unused
             "saute_cfgs": {"safety_budget": budget},
         }
+    
     return {}
 
 
