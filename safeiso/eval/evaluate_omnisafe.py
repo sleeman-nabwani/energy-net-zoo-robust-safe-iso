@@ -4,6 +4,9 @@ from typing import Iterable, List, Tuple
 
 # Runner: evaluate ONE policy/run against a suite (deterministic)
 from safeiso.eval.suite_eval import run_suite
+from safeiso.utils.logging_config import get_logger
+
+logger = get_logger("eval.evaluate_omnisafe")
 
 
 def has_evalpack(run_dir: str) -> bool:
@@ -64,10 +67,10 @@ def main():
 
     targets = normalize_targets(search_roots)
     if not targets:
-        print("No runs found to evaluate.")
+        logger.info("No runs found to evaluate.")
         return
 
-    print(f"Discovered {len(targets)} runs.")
+    logger.info(f"Discovered {len(targets)} runs.")
     failed = []
     for run_dir in targets:
         algo, mode = infer_algo_mode(run_dir)
@@ -80,15 +83,15 @@ def main():
         out_eps  = os.path.join(out_dir, "stress_eval_episodes.csv")   # per-episode
 
         if (not args.overwrite) and os.path.isfile(out_scen) and os.path.isfile(out_eps):
-            print(f"[skip] {run_dir} (already evaluated)")
+            logger.info(f"[skip] {run_dir} (already evaluated)")
             continue
 
         # Require EvalPack
         if not has_evalpack(run_dir):
-            print(f"[skip] {run_dir} (no EvalPack found; retrain required)")
+            logger.warning(f"[skip] {run_dir} (no EvalPack found; retrain required)")
             continue
 
-        print(f"[eval] {run_dir} -> {out_scen}")
+        logger.info(f"[eval] {run_dir} -> {out_scen}")
 
         # Ensure env IDs registered in this process (harmless if already imported)
         try:
@@ -117,14 +120,14 @@ def main():
             )
         except Exception as e:
             failed.append((run_dir, str(e)))
-            print(f"[fail] {run_dir} :: {e}")
+            logger.error(f"[fail] {run_dir} :: {e}")
 
     if failed:
-        print("Some runs failed EvalPack evaluation:")
+        logger.error("Some runs failed EvalPack evaluation:")
         for p, err in failed:
-            print(" -", p, "::", err)
+            logger.error(f" - {p} :: {err}")
 
-    print("Done.")
+    logger.info("Done.")
 
 if __name__ == "__main__":
     main()

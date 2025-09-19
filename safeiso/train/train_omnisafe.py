@@ -18,6 +18,9 @@ import numpy as np
 
 # Ensure SafeISO env IDs are registered
 import safeiso.utils.register_envs  # noqa: F401
+from safeiso.utils.logging_config import get_logger
+
+logger = get_logger("train.train_omnisafe")
 
 from omnisafe.envs import make as omni_make
 from omnisafe.utils.config import Config
@@ -168,13 +171,13 @@ def main():
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
 
-    print(json.dumps({
+    logger.info(json.dumps({
         "algo": args.algo, "cmdp": args.cmdp, "steps": args.steps,
         "seed": args.seed, "device": args.device, "pcs": args.pcs,
         "preset": args.preset, "cost_limit": args.cost_limit,
         "eval_every": args.eval_every, "eval_episodes": args.eval_episodes,
         "save_dir": args.save_dir
-    }, indent=2), flush=True)
+    }, indent=2))
 
     env_id = build_env_id(args)
     Algo = get_algo_class(args.algo)
@@ -226,10 +229,10 @@ def main():
             try:
                 policy_act = make_policy_act(agent)
             except Exception as e:
-                print(f"[eval] policy mode unavailable, falling back to random: {e!r}")
+                logger.warning(f"[eval] policy mode unavailable, falling back to random: {e!r}")
                 policy_act = None
         metrics = rollout_metrics(eval_env, episodes=args.eval_episodes, policy_act=policy_act, deterministic=True)
-        print(json.dumps({
+        logger.info(json.dumps({
             "eval_reward_mean": metrics["reward_mean"],
             "eval_cost_avg_mean": metrics["avg_step_cost_mean"],
             "eval_ep_len_mean": metrics["ep_len_mean"],
@@ -277,9 +280,9 @@ def main():
                 export_env.close()
             except Exception:
                 pass
-        print(f"[EvalPack] Exported at: {os.path.join(args.save_dir, 'evalpack')}")
+        logger.info(f"[EvalPack] Exported at: {os.path.join(args.save_dir, 'evalpack')}")
     except Exception as e:
-        print(f"[EvalPack] Export failed: {e}")
+        logger.error(f"[EvalPack] Export failed: {e}")
 
 
 if __name__ == "__main__":

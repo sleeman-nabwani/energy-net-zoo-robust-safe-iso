@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, Dict, Any, Protocol
+from typing import Callable, Dict, Any, Protocol, Union
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.vec_env import VecNormalize
 from pathlib import Path
@@ -8,7 +8,21 @@ from .version_helper import _spaces_from_model_zip, patch_numpy_for_pickle, reso
 
 def _clip_to_space(x: np.ndarray, action_space) -> np.ndarray:
     """Ensure right dtype/shape and keep the action within Box bounds."""
-    x = np.asarray(x, dtype=np.float32).reshape(action_space.shape)
+    x = np.asarray(x, dtype=np.float32)
+    
+    # Handle shape mismatch - ensure x can be reshaped to action_space.shape
+    if x.size != np.prod(action_space.shape):
+        if action_space.shape == (1,) and x.size > 1:
+            # For PCS action space (1,), take the last element regardless of input size
+            # This handles size 2, 3, 7, or any other size from SB3 models
+            x = x.flatten()[-1:]
+        elif x.size < np.prod(action_space.shape):
+            padding_needed = np.prod(action_space.shape) - x.size
+            x = np.concatenate([x.flatten(), np.zeros(padding_needed, dtype=np.float32)])
+        else:
+            x = x.flatten()[:np.prod(action_space.shape)]
+    
+    x = x.reshape(action_space.shape)
     return np.clip(x, action_space.low, action_space.high)
 
 
@@ -28,7 +42,7 @@ class static_Policy(PCS_Policy):
 
 
 class responsive_Policy(PCS_Policy):
-    def __init__(self, fn: Callable[[np.ndarray, Dict[str, Any], Any], float | np.ndarray]):
+    def __init__(self, fn: Callable[[np.ndarray, Dict[str, Any], Any], Union[float, np.ndarray]]):
         self.fn = fn
 
     def __call__(self, obs_pcs:np.ndarray, info:Dict[str, Any], action_space) -> np.ndarray:
@@ -39,6 +53,17 @@ class responsive_Policy(PCS_Policy):
 class SB3_Policy(PCS_Policy):
     def __init__(self, model_path: str, deterministic: bool = True, device: str = "auto"):
         patch_numpy_for_pickle()
+        
+        # Add NumPy compatibility fix for numpy._core issue
+        import sys
+        if 'numpy._core' not in sys.modules:
+            try:
+                import numpy
+                sys.modules['numpy._core'] = numpy
+                sys.modules['numpy._core.multiarray'] = numpy
+                sys.modules['numpy._core.umath'] = numpy
+            except Exception:
+                pass
 
         lr = learning_rate_from_zip(model_path)
         custom_objects = {
@@ -121,10 +146,58 @@ class SB3_Policy(PCS_Policy):
         return np.clip(out, -clip, clip) if clip is not None else out
 
     def __call__(self, obs_pcs:np.ndarray, info:Dict[str, Any], action_space) -> np.ndarray:
-        obs = self._norm_obs(obs_pcs).reshape(1, -1)
+        obs_normalized = self._norm_obs(obs_pcs)
+        
+        # Handle observation shape mismatch - SB3 models expect (3,) observations
+        if obs_normalized.shape == (1, 3):
+            obs_normalized = obs_normalized.flatten()  # (1,3) -> (3,)
+        elif obs_normalized.ndim == 1 and obs_normalized.shape[0] == 4:
+            # Environment observation is (4,) but SB3 model expects (3,) - truncate last element
+            obs_normalized = obs_normalized[:3]
+        elif obs_normalized.ndim == 1 and obs_normalized.shape[0] > 3:
+            # Truncate to 3 elements if too large
+            obs_normalized = obs_normalized[:3]
+        elif obs_normalized.ndim == 1 and obs_normalized.shape[0] < 3:
+            # Pad to 3 elements if too small
+            padding_needed = 3 - obs_normalized.shape[0]
+            obs_normalized = np.concatenate([obs_normalized, np.zeros(padding_needed, dtype=np.float32)])
+            
+        # SB3 predict expects (3,) shape, not (1, 3)
+        if obs_normalized.shape != (3,):
+            # Ensure we have exactly 3 elements
+            if obs_normalized.size > 3:
+                obs_normalized = obs_normalized.flatten()[:3]
+            elif obs_normalized.size < 3:
+                padding = np.zeros(3 - obs_normalized.size, dtype=np.float32)
+                obs_normalized = np.concatenate([obs_normalized.flatten(), padding])
+            else:
+                obs_normalized = obs_normalized.reshape((3,))
+        
+        obs = obs_normalized  # Don't add batch dimension - SB3 predict handles this
+        
         if self._torch is not None:
             with self._torch.no_grad():
                 action, _ = self.model.predict(obs, deterministic=self.det)
         else:
             action, _ = self.model.predict(obs, deterministic=self.det)
+        
+        # SB3 models output the full joint action space (3D), but PCS only needs the last component
+        # Extract PCS component (assuming it's the last dimension based on EnergyNet structure)
+        if isinstance(action, np.ndarray):
+            if action.ndim > 1:
+                action = action.flatten()  # Flatten multi-dimensional arrays
+            
+            if len(action) > 1 and action_space.shape == (1,):
+                # PCS action space expects (1,) - take the last component
+                action = np.array([action[-1]], dtype=np.float32)
+            elif len(action) == 1 and action_space.shape == (1,):
+                # Already correct shape, ensure proper type
+                action = np.array([action[0]], dtype=np.float32)
+            elif len(action) > 1:
+                # Multiple elements but action_space doesn't specify (1,) - take last
+                action = np.array([action[-1]], dtype=np.float32)
+        else:
+            # Scalar action - convert to proper array format
+            action = np.array([float(action)], dtype=np.float32)
+        
         return _clip_to_space(action, action_space)

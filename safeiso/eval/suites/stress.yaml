@@ -1,0 +1,90 @@
+name: Stress Test Suite
+mode: CMDP
+algo: PPO
+horizon: 48
+episodes: 20
+cost_limit: 0.25
+device: cuda
+output_dir: runs/eval/stress
+
+# Comprehensive stress testing across extreme and edge-case conditions
+# Tests robustness and failure modes
+
+scenarios:
+  # Extreme no-support scenario
+  - name: extreme_no_support
+    preset: evaluation
+    pcs: "static:0.0"
+    episodes: 20
+    notes: "Worst case - no PCS support at all"
+
+  # Extreme static scenarios
+  - name: static_minimal
+    preset: evaluation
+    pcs: "static:1.0"
+    episodes: 20
+    notes: "Minimal static support - stress test"
+  
+  - name: static_excessive
+    preset: evaluation
+    pcs: "static:15.0"
+    episodes: 20
+    notes: "Excessive static injection - boundary test"
+
+  # Aggressive responsive scenarios
+  - name: responsive_aggressive
+    preset: evaluation
+    pcs: "responsive:spread_prop?gain=8.0&clip=40.0"
+    episodes: 20
+    notes: "Very aggressive price response"
+  
+  - name: responsive_minimal
+    preset: evaluation
+    pcs: "responsive:spread_prop?gain=0.5&clip=5.0"
+    episodes: 20
+    notes: "Minimal price response"
+  
+  - name: responsive_uncapped
+    preset: evaluation
+    pcs: "responsive:spread_prop?gain=10.0"
+    episodes: 20
+    notes: "Uncapped responsive - stress test"
+
+  # SoC extreme tracking
+  - name: soc_low_target
+    preset: evaluation
+    pcs: "responsive:soc_track?target=0.2&k=15.0"
+    episodes: 20
+    notes: "Aggressive low SoC target"
+  
+  - name: soc_high_target
+    preset: evaluation
+    pcs: "responsive:soc_track?target=0.8&k=15.0"
+    episodes: 20
+    notes: "Aggressive high SoC target"
+  
+  - name: soc_hold_extremes
+    preset: evaluation
+    pcs: "responsive:soc_hold?low=0.1&high=0.9&gain=10.0"
+    episodes: 20
+    notes: "Wide SoC deadband - stress test"
+
+  # Net following extremes
+  - name: net_follow_aggressive
+    preset: evaluation
+    pcs: "responsive:net_follow?k=0.8&use_dispatch=false"
+    episodes: 20
+    notes: "Aggressive net following without dispatch"
+  
+  - name: ramp_smoother_high
+    preset: evaluation
+    pcs: "responsive:ramp_smoother?alpha=0.9&max_step=30.0"
+    episodes: 20
+    notes: "Aggressive ramp smoothing"
+
+  # Mixed stress conditions (if SB3 models available)
+  - name: sb3_stress_test
+    preset: evaluation
+    pcs: "sb3:/home/sleemann/energy-net-zoo-robust-safe-iso/trained_pcs_models/SettingFiveL/pcs_td3_400.zip"
+    episodes: 20
+    notes: "Stress test with trained SB3 PCS model"

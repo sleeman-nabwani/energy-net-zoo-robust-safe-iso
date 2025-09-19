@@ -1,0 +1,59 @@
+name: Standard Evaluation Suite
+mode: CMDP
+algo: PPO
+horizon: 48
+episodes: 10
+cost_limit: 0.25
+device: cuda
+output_dir: runs/eval/standard
+
+# Standard operating conditions for baseline performance evaluation
+# Tests typical scenarios that models should handle well
+
+scenarios:
+  # Baseline scenarios with no PCS support
+  - name: baseline_no_pcs
+    preset: evaluation
+    pcs: "static:0.0"
+    episodes: 10
+    notes: "Baseline with no PCS support"
+
+  # Static PCS scenarios (fixed power injection)
+  - name: static_moderate
+    preset: evaluation
+    pcs: "static:5.0"
+    episodes: 10
+    notes: "Moderate static PCS support"
+  
+  - name: static_high
+    preset: evaluation
+    pcs: "static:10.0"
+    episodes: 10
+    notes: "High static PCS support"
+
+  # Responsive PCS scenarios (market-based)
+  - name: responsive_conservative
+    preset: evaluation
+    pcs: "responsive:spread_prop?gain=2.0&clip=15.0"
+    episodes: 10
+    notes: "Conservative responsive PCS"
+  
+  - name: responsive_standard
+    preset: evaluation
+    pcs: "responsive:spread_prop?gain=4.0&clip=25.0"
+    episodes: 10
+    notes: "Standard responsive PCS configuration"
+
+  # SoC tracking scenarios
+  - name: soc_tracker
+    preset: evaluation
+    pcs: "responsive:soc_track?target=0.5&k=10.0"
+    episodes: 10
+    notes: "PCS maintains 50% SoC target"
+
+  # Net load following
+  - name: net_follower
+    preset: evaluation
+    pcs: "responsive:net_follow?k=0.3&use_dispatch=true"
+    episodes: 10
+    notes: "PCS follows net load with dispatch awareness"

@@ -1,6 +1,0 @@
-scenarios:
-  - name: baseline_static_0
-    preset: default
-    pcs: static:0.0
-    episodes: 8
-
