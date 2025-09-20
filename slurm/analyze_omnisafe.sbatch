@@ -103,20 +103,24 @@ echo "[info] Starting OmniSafe analysis..."
 if [ -n "$OUTPUT_DIR" ]; then
     # Use specified output directory
     python3 scripts/omnisafe_analysis.py \
+        --enhanced-analysis \
+        --episodes 1000 \
         --results-dir "$MODELS_DIR" \
         --output-dir "$OUTPUT_DIR" \
         --algorithms $ALGORITHMS \
         --pcs-modes $PCS_MODES \
         --suites $SUITES \
-        --force-reeval
+        --use-cache
 else
     # Auto-detect output directory based on batch
     python3 scripts/omnisafe_analysis.py \
+        --enhanced-analysis \
+        --episodes 1000 \
         --results-dir "$MODELS_DIR" \
         --algorithms $ALGORITHMS \
         --pcs-modes $PCS_MODES \
         --suites $SUITES \
-        --force-reeval
+        --use-cache
 fi
 
 analysis_status=$?
