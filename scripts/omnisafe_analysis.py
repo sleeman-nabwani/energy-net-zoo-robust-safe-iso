@@ -26,6 +26,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from scipy import stats
 import subprocess
 import csv
+import math
 
 # Configure plotting style
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -51,7 +52,10 @@ class OmniSafeAnalysis:
                  algorithms: List[str] = None,
                  pcs_modes: List[str] = None,
                  suites: List[str] = None,
-                 force_reeval: bool = True):  # Always force fresh evaluations by default
+                 force_reeval: bool = True,  # Always force fresh evaluations by default
+                 enhanced_analysis: bool = False,
+                 episodes: int = 10,
+                 per_pcs: bool = False):
         
         self.results_dir = Path(results_dir)
         
@@ -72,6 +76,9 @@ class OmniSafeAnalysis:
         self.pcs_modes = pcs_modes  # Will auto-detect if None
         self.suites = suites or ['standard', 'stress']
         self.force_reeval = force_reeval  # Store force re-evaluation setting
+        self.enhanced_analysis = enhanced_analysis
+        self.episodes = episodes
+        self.per_pcs = per_pcs
         
         # Create subdirectories
         self.plots_dir = self.output_dir / "plots"
@@ -111,13 +118,26 @@ class OmniSafeAnalysis:
     def check_trained_models(self) -> pd.DataFrame:
         """Check which models have been trained."""
         trained = []
-        # Handle both legacy and new directory structures
-        if (self.results_dir / "omnisafe_trained").exists():
-            # Legacy structure: runs/omnisafe_trained/
-            base_path = self.results_dir / "omnisafe_trained"
-        else:
-            # New structure: runs/omnisafe_trained_BATCH/ (models are directly in results_dir)
+        
+        # Check if results_dir is already a batch directory
+        if self.results_dir.name.startswith("omnisafe_trained_"):
             base_path = self.results_dir
+            print(f"Using direct batch directory: {base_path.name}")
+        else:
+            # Auto-detect the most recent batch directory
+            batch_dirs = list(self.results_dir.glob("omnisafe_trained_*"))
+            if batch_dirs:
+                # Sort by modification time, get the most recent
+                batch_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                base_path = batch_dirs[0]
+                print(f"Using batch directory: {base_path.name}")
+            elif (self.results_dir / "omnisafe_trained").exists():
+                # Legacy structure: runs/omnisafe_trained/
+                base_path = self.results_dir / "omnisafe_trained"
+                print("Using legacy structure")
+            else:
+                print("❌ No trained models directory found")
+                return pd.DataFrame()
         
         # Auto-detect PCS modes if not specified
         if self.pcs_modes is None:
@@ -157,8 +177,10 @@ class OmniSafeAnalysis:
         
         return pd.DataFrame(trained)
     
-    def run_evaluation(self, model_path: str, suite: str, episodes: int = 10) -> Dict[str, Any]:
+    def run_evaluation(self, model_path: str, suite: str, episodes: int = None) -> Dict[str, Any]:
         """Run evaluation using the existing suite_eval.py."""
+        if episodes is None:
+            episodes = self.episodes
         suite_path = f"safeiso/eval/suites/{suite}.yaml"
         
         # Extract algo/pcs from path
@@ -234,7 +256,7 @@ class OmniSafeAnalysis:
             return {}
     
     def collect_all_results(self) -> pd.DataFrame:
-        """Collect all evaluation results."""
+        """Collect all evaluation results at episode level."""
         print("\n📊 Collecting Results")
         print("=" * 60)
         
@@ -246,22 +268,54 @@ class OmniSafeAnalysis:
             print("❌ No trained models found!")
             return pd.DataFrame()
         
-        # Run evaluations
+        # Run evaluations and collect episode-level data
         results = []
         for _, model in trained_df.iterrows():
             for suite in self.suites:
-                eval_results = self.run_evaluation(model['path'], suite)
+                # Run evaluation to ensure CSV files exist
+                self.run_evaluation(model['path'], suite)
                 
-                if eval_results:
-                    results.append({
-                        'algorithm': model['algorithm'],
-                        'pcs_mode': model['pcs_mode'],
-                        'seed': model['seed'],
-                        'suite': suite,
-                        **eval_results
-                    })
+                # Load episode-level data directly from CSV
+                eval_dir = Path(model['path']) / "eval" / suite
+                episodes_csv = eval_dir / "episodes.csv"
+                
+                if episodes_csv.exists():
+                    try:
+                        episodes_df = pd.read_csv(episodes_csv)
+                        
+                        # Add metadata columns
+                        episodes_df['algorithm'] = model['algorithm']
+                        episodes_df['pcs_mode'] = model['pcs_mode']
+                        episodes_df['model_seed'] = model['seed']
+                        episodes_df['suite'] = suite
+                        
+                        # Rename columns to match expected names
+                        column_mapping = {
+                            'ep_cost_mean': 'avg_cost',
+                            'ep_return': 'avg_reward',
+                            'ep_cost_sum': 'total_cost'
+                        }
+                        episodes_df = episodes_df.rename(columns=column_mapping)
+                        
+                        # Add missing columns with defaults
+                        if 'soc_oob_steps' not in episodes_df.columns:
+                            episodes_df['soc_oob_steps'] = 0
+                        if 'ep_length' not in episodes_df.columns:
+                            episodes_df['ep_length'] = episodes_df.get('horizon', 48)
+                        if 'total_steps' not in episodes_df.columns:
+                            episodes_df['total_steps'] = episodes_df['ep_length']
+                            
+                        results.append(episodes_df)
+                        
+                    except Exception as e:
+                        print(f"  ✗ Error loading {episodes_csv}: {e}")
         
-        return pd.DataFrame(results)
+        if results:
+            combined_df = pd.concat(results, ignore_index=True)
+            print(f"Collected {len(combined_df)} episodes from {len(results)} evaluations")
+            return combined_df
+        else:
+            return pd.DataFrame()
     
     def calculate_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate aggregated metrics with confidence intervals."""
@@ -321,6 +375,330 @@ class OmniSafeAnalysis:
         upper = np.percentile(bootstrap_means, (1 - alpha/2) * 100)
         
         return (lower, upper)
+    
+    def _ci95_norm(self, x: pd.Series) -> pd.Series:
+        """Calculate 95% confidence interval using normal approximation."""
+        m = x.mean()
+        s = x.std(ddof=1)
+        n = x.count()
+        ci = 1.96 * s / max(np.sqrt(n), 1.0)
+        return pd.Series({'mean': m, 'ci95': ci, 'n': n})
+    
+    def compute_violation_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate violation metrics grouped by algorithm × PCS mode."""
+        if df.empty:
+            return pd.DataFrame()
+
+        # Ensure total_steps column exists
+        if 'total_steps' not in df.columns:
+            df = df.assign(total_steps=df.get('ep_length', df.get('steps', 480)))
+        
+        # Group by algorithm and PCS mode and calculate metrics
+        results = []
+        for (algo, pcs), group in df.groupby(['algorithm', 'pcs_mode']):
+            cost_stats = self._ci95_norm(group['avg_cost'])
+            reward_stats = self._ci95_norm(group['avg_reward'])
+            
+            result = {
+                'algorithm': algo,
+                'pcs_mode': pcs,
+                'avg_cost_mean': cost_stats['mean'],
+                'avg_cost_ci95': cost_stats['ci95'],
+                'avg_cost_n': cost_stats['n'],
+                'avg_reward_mean': reward_stats['mean'],
+                'avg_reward_ci95': reward_stats['ci95'],
+                'avg_reward_n': reward_stats['n'],
+                'shortfall_steps': group['shortfall_steps'].sum(),
+                'freq_oob_steps': group['freq_oob_steps'].sum(),
+                'soc_oob_steps': group['soc_oob_steps'].sum(),
+                'total_steps': group['total_steps'].sum(),
+            }
+            results.append(result)
+        
+        grouped = pd.DataFrame(results)
+        
+        # Calculate violation rates
+        grouped['shortfall_rate'] = grouped['shortfall_steps'] / grouped['total_steps']
+        grouped['freq_rate'] = grouped['freq_oob_steps'] / grouped['total_steps']
+        grouped['soc_rate'] = grouped['soc_oob_steps'] / grouped['total_steps']
+        
+        # Rank by cost (lower is better)
+        grouped['rank_by_cost'] = grouped['avg_cost_mean'].rank(method='dense', ascending=True).astype(int)
+        
+        return grouped
+    
+    def compute_algo_comparison_table(self, metrics_df: pd.DataFrame, per_pcs: bool = False) -> pd.DataFrame:
+        """Generate algorithm comparison table, optionally aggregated across PCS modes."""
+        if metrics_df.empty:
+            return pd.DataFrame()
+            
+        if per_pcs:
+            table = metrics_df.copy()
+        else:
+            # Aggregate across PCS modes for headline table
+            table = (metrics_df
+                     .groupby('algorithm', as_index=False)
+                     .agg({
+                         'avg_cost_mean': 'mean',
+                         'avg_cost_ci95': 'mean',
+                         'avg_reward_mean': 'mean',
+                         'avg_reward_ci95': 'mean',
+                         'shortfall_rate': 'mean',
+                         'freq_rate': 'mean',
+                         'soc_rate': 'mean'
+                     }))
+            table['rank_by_cost'] = table['avg_cost_mean'].rank(method='dense', ascending=True).astype(int)
+            
+        return table.sort_values(['rank_by_cost', 'algorithm'])
+    
+    def plot_algo_pcs_heatmap(self, metrics_df: pd.DataFrame, outpath: Path):
+        """Generate heatmap of average cost by algorithm × PCS mode."""
+        if metrics_df.empty:
+            return
+            
+        pivot = metrics_df.pivot(index='algorithm', columns='pcs_mode', values='avg_cost_mean')
+        plt.figure(figsize=(10, 5))
+        ax = sns.heatmap(pivot, annot=True, fmt='.3f', cmap='RdYlGn_r', 
+                        linewidths=.5, cbar_kws={'label': 'Avg Cost'})
+        ax.set_title('Average Cost by Algorithm × PCS Mode')
+        plt.tight_layout()
+        plt.savefig(outpath, dpi=200)
+        plt.close()
+    
+    def plot_cost_reward_scatter(self, metrics_df: pd.DataFrame, outpath: Path):
+        """Generate cost vs reward scatter plot with PCS mode annotations."""
+        if metrics_df.empty:
+            return
+            
+        plt.figure(figsize=(8, 6))
+        for algo, g in metrics_df.groupby('algorithm'):
+            plt.scatter(g['avg_cost_mean'], g['avg_reward_mean'], label=algo, s=60)
+            for _, r in g.iterrows():
+                plt.annotate(r['pcs_mode'], (r['avg_cost_mean'], r['avg_reward_mean']), 
+                           fontsize=8, alpha=0.8)
+        
+        plt.xlabel('Cost (lower better)')
+        plt.ylabel('Reward (higher better)')
+        plt.title('Cost–Reward by Algorithm × PCS Mode')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outpath, dpi=200)
+        plt.close()
+    
+    def plot_algo_pcs_line(self, metrics_df: pd.DataFrame, outpath: Path):
+        """Generate line plot of cost across PCS modes for each algorithm."""
+        if metrics_df.empty:
+            return
+            
+        plt.figure(figsize=(11, 5))
+        # Stable ordering for PCS modes
+        order = sorted(metrics_df['pcs_mode'].unique())
+        
+        for algo, g in metrics_df.groupby('algorithm'):
+            g = g.set_index('pcs_mode').loc[order].reset_index()
+            plt.plot(g['pcs_mode'], g['avg_cost_mean'], marker='o', label=algo)
+            plt.fill_between(g['pcs_mode'], 
+                           g['avg_cost_mean'] - g['avg_cost_ci95'], 
+                           g['avg_cost_mean'] + g['avg_cost_ci95'], 
+                           alpha=0.15)
+        
+        plt.xticks(rotation=45)
+        plt.ylabel('Avg Cost')
+        plt.title('Cost across PCS Modes')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(outpath, dpi=200)
+        plt.close()
+    
+    def plot_per_algo_pcs(self, metrics_df: pd.DataFrame, algo: str, outdir: Path):
+        """Generate per-algorithm PCS analysis with 3-panel figure."""
+        sub = metrics_df[metrics_df['algorithm'] == algo].copy()
+        if sub.empty:
+            return
+            
+        order = sorted(sub['pcs_mode'].unique())
+        fig, axs = plt.subplots(1, 3, figsize=(17, 5))
+        
+        # Panel 1: Cost
+        costs = [sub[sub.pcs_mode == p]['avg_cost_mean'].values[0] for p in order]
+        cost_cis = [sub[sub.pcs_mode == p]['avg_cost_ci95'].values[0] for p in order]
+        axs[0].bar(order, costs, yerr=cost_cis, capsize=3)
+        axs[0].set_title(f'{algo} — Avg Cost by PCS')
+        axs[0].set_ylabel('Avg Cost')
+        axs[0].tick_params(axis='x', rotation=45)
+        
+        # Panel 2: Reward
+        rewards = [sub[sub.pcs_mode == p]['avg_reward_mean'].values[0] for p in order]
+        reward_cis = [sub[sub.pcs_mode == p]['avg_reward_ci95'].values[0] for p in order]
+        axs[1].bar(order, rewards, yerr=reward_cis, capsize=3)
+        axs[1].set_title(f'{algo} — Avg Reward by PCS')
+        axs[1].set_ylabel('Avg Reward')
+        axs[1].tick_params(axis='x', rotation=45)
+        
+        # Panel 3: Violations stacked (%)
+        s = [sub[sub.pcs_mode == p]['shortfall_rate'].values[0] for p in order]
+        f = [sub[sub.pcs_mode == p]['freq_rate'].values[0] for p in order]
+        o = [sub[sub.pcs_mode == p]['soc_rate'].values[0] for p in order]
+        width = 0.6
+        axs[2].bar(order, s, width, label='shortfall')
+        axs[2].bar(order, f, width, bottom=s, label='freq')
+        axs[2].bar(order, o, width, bottom=np.array(s) + np.array(f), label='soc')
+        axs[2].set_title(f'{algo} — Violation Breakdown by PCS')
+        axs[2].set_ylabel('Rate')
+        axs[2].legend()
+        axs[2].tick_params(axis='x', rotation=45)
+        
+        fig.suptitle(f'{algo} — PCS Analysis', y=1.03)
+        plt.tight_layout()
+        
+        # Save both PNG and PDF
+        for ext in ('png', 'pdf'):
+            plt.savefig(outdir / f'{algo}_analysis.{ext}', dpi=200)
+        plt.close()
+    
+    def generate_enhanced_composite(self, df: pd.DataFrame, metrics_df: pd.DataFrame):
+        """Generate enhanced composite plot with cost/reward/PCS focus."""
+        print("📊 Generating Enhanced Composite Plot...")
+        
+        # Create a figure with multiple subplots (3x3 grid)
+        fig = plt.figure(figsize=(20, 12))
+        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        
+        # 1. Average Cost per Algorithm (replaces pass rate)
+        ax1 = fig.add_subplot(gs[0, 0])
+        if not metrics_df.empty:
+            algo_costs = metrics_df.groupby('algorithm')['avg_cost_mean'].mean()
+            algo_cost_cis = metrics_df.groupby('algorithm')['avg_cost_ci95'].mean()
+            
+            bars = ax1.bar(range(len(algo_costs)), algo_costs.values, 
+                          yerr=algo_cost_cis.values, capsize=3)
+            ax1.set_xticks(range(len(algo_costs)))
+            ax1.set_xticklabels(algo_costs.index, rotation=45)
+            ax1.set_ylabel('Average Cost')
+            ax1.set_title('Average Cost by Algorithm')
+            ax1.axhline(y=0.1, color='red', linestyle='--', alpha=0.5, label='Target Limit')
+            ax1.legend()
+            
+            # Add value labels
+            for i, (v, ci) in enumerate(zip(algo_costs.values, algo_cost_cis.values)):
+                ax1.text(i, v + ci + 0.01, f'{v:.3f}', ha='center', fontsize=9)
+        
+        # 2. Average Reward per Algorithm (replaces pass rate)
+        ax2 = fig.add_subplot(gs[0, 1])
+        if not metrics_df.empty:
+            algo_rewards = metrics_df.groupby('algorithm')['avg_reward_mean'].mean()
+            algo_reward_cis = metrics_df.groupby('algorithm')['avg_reward_ci95'].mean()
+            
+            bars = ax2.bar(range(len(algo_rewards)), algo_rewards.values,
+                          yerr=algo_reward_cis.values, capsize=3)
+            ax2.set_xticks(range(len(algo_rewards)))
+            ax2.set_xticklabels(algo_rewards.index, rotation=45)
+            ax2.set_ylabel('Average Reward')
+            ax2.set_title('Average Reward by Algorithm')
+            
+            # Add value labels
+            for i, (v, ci) in enumerate(zip(algo_rewards.values, algo_reward_cis.values)):
+                ax2.text(i, v + ci + 0.5, f'{v:.1f}', ha='center', fontsize=9)
+        
+        # 3. Cost vs Reward Scatter with PCS annotations (replaces empty panel)
+        ax3 = fig.add_subplot(gs[0, 2])
+        if not metrics_df.empty:
+            for algo, g in metrics_df.groupby('algorithm'):
+                ax3.scatter(g['avg_cost_mean'], g['avg_reward_mean'], 
+                           label=algo, s=80, alpha=0.7)
+                for _, row in g.iterrows():
+                    ax3.annotate(row['pcs_mode'], 
+                               (row['avg_cost_mean'], row['avg_reward_mean']),
+                               xytext=(3, 3), textcoords='offset points', 
+                               fontsize=8, alpha=0.8)
+            
+            ax3.set_xlabel('Average Cost')
+            ax3.set_ylabel('Average Reward')
+            ax3.set_title('Cost-Reward Trade-off by PCS')
+            ax3.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+            ax3.grid(True, alpha=0.3)
+        
+        # 4. Violations Analysis (keep existing)
+        ax4 = fig.add_subplot(gs[1, 0])
+        if not metrics_df.empty:
+            vio_summary = metrics_df.groupby('algorithm')[['shortfall_rate', 'freq_rate', 'soc_rate']].mean()
+            vio_summary.plot(kind='bar', stacked=True, ax=ax4)
+            ax4.set_ylabel('Violation Rate')
+            ax4.set_title('Violation Rates by Algorithm')
+            ax4.set_xticklabels(ax4.get_xticklabels(), rotation=45)
+            ax4.legend(title='Violation Type')
+        
+        # 5. Performance by PCS Mode Heatmap
+        ax5 = fig.add_subplot(gs[1, 1])
+        if not metrics_df.empty:
+            pivot = metrics_df.pivot_table(values='avg_cost_mean', index='algorithm', 
+                                          columns='pcs_mode', aggfunc='mean')
+            if not pivot.empty:
+                sns.heatmap(pivot, annot=True, fmt='.3f', cmap='RdYlGn_r', 
+                          ax=ax5, cbar_kws={'label': 'Avg Cost'})
+                ax5.set_title('Cost by Algorithm × PCS Mode')
+        
+        # 6. Cost Distribution by Algorithm
+        ax6 = fig.add_subplot(gs[1, 2])
+        if not df.empty and 'avg_cost' in df.columns:
+            algo_groups = [group['avg_cost'].values for name, group in df.groupby('algorithm')]
+            algo_names = [name for name, _ in df.groupby('algorithm')]
+            
+            ax6.boxplot(algo_groups, labels=algo_names)
+            ax6.set_ylabel('Episode Cost')
+            ax6.set_title('Cost Distribution by Algorithm')
+            ax6.tick_params(axis='x', rotation=45)
+        
+        # 7. PCS Mode Comparison (Line plot)
+        ax7 = fig.add_subplot(gs[2, 0])
+        if not metrics_df.empty:
+            pcs_order = sorted(metrics_df['pcs_mode'].unique())
+            for algo, g in metrics_df.groupby('algorithm'):
+                g_ordered = g.set_index('pcs_mode').reindex(pcs_order).reset_index()
+                ax7.plot(g_ordered['pcs_mode'], g_ordered['avg_cost_mean'], 
+                        marker='o', label=algo)
+            ax7.set_ylabel('Average Cost')
+            ax7.set_title('Cost Across PCS Modes')
+            ax7.tick_params(axis='x', rotation=45)
+            ax7.legend()
+        
+        # 8. Ranking Summary
+        ax8 = fig.add_subplot(gs[2, 1])
+        if not metrics_df.empty:
+            algo_ranks = metrics_df.groupby('algorithm')['rank_by_cost'].mean().sort_values()
+            bars = ax8.barh(range(len(algo_ranks)), algo_ranks.values)
+            ax8.set_yticks(range(len(algo_ranks)))
+            ax8.set_yticklabels(algo_ranks.index)
+            ax8.set_xlabel('Average Cost Rank')
+            ax8.set_title('Algorithm Cost Rankings')
+            
+            # Color bars by rank
+            for i, (bar, rank) in enumerate(zip(bars, algo_ranks.values)):
+                if rank <= 2:
+                    bar.set_color('green')
+                elif rank <= 4:
+                    bar.set_color('orange')
+                else:
+                    bar.set_color('red')
+        
+        # 9. Violation Breakdown by PCS
+        ax9 = fig.add_subplot(gs[2, 2])
+        if not metrics_df.empty:
+            pcs_vio = metrics_df.groupby('pcs_mode')[['shortfall_rate', 'freq_rate', 'soc_rate']].mean()
+            pcs_vio.plot(kind='bar', ax=ax9)
+            ax9.set_ylabel('Violation Rate')
+            ax9.set_title('Violations by PCS Mode')
+            ax9.tick_params(axis='x', rotation=45)
+            ax9.legend(title='Violation Type')
+        
+        plt.suptitle('OmniSafe Enhanced Analysis - Cost & PCS Focus', fontsize=18, y=1.02)
+        
+        # Save composite plot
+        plt.savefig(self.plots_dir / 'composite_overview.png', dpi=300, bbox_inches='tight')
+        plt.savefig(self.plots_dir / 'composite_overview.pdf', bbox_inches='tight')
+        plt.close()
+        
+        print(f"✅ Saved enhanced composite plot to {self.plots_dir}/")
     
     def generate_plots(self, df: pd.DataFrame, metrics_df: pd.DataFrame):
         """Generate comprehensive plots."""
@@ -627,6 +1005,8 @@ class OmniSafeAnalysis:
         """Run complete analysis pipeline."""
         print("\n" + "=" * 60)
         print("OmniSafe Benchmark Analysis")
+        if self.enhanced_analysis:
+            print("(Enhanced PCS & Cost-Centric Mode)")
         print("=" * 60)
         
         # Collect results
@@ -638,25 +1018,71 @@ class OmniSafeAnalysis:
             print("  sbatch --array=0-29 slurm/train_omnisafe_array.sbatch")
             return
         
-        # Calculate metrics
-        metrics_df = self.calculate_metrics(df)
-        
-        # Generate plots
-        self.generate_plots(df, metrics_df)
-        
-        # Generate report
-        self.generate_report(df, metrics_df)
-        
-        # Print summary
-        print("\n" + "=" * 60)
-        print("ANALYSIS COMPLETE")
-        print("=" * 60)
-        
-        if not metrics_df.empty:
-            print("\nTop 3 Algorithms:")
-            for i, (_, row) in enumerate(metrics_df.head(3).iterrows(), 1):
-                print(f"{i}. {row['algorithm']}: Pass Rate={row['pass_rate_mean']:.1%}, "
-                      f"Cost={row['cost_mean']:.3f}, Reward={row['reward_mean']:.2f}")
+        if self.enhanced_analysis:
+            # Enhanced analysis pipeline
+            print("\n🔬 Running Enhanced Analysis")
+            print("=" * 60)
+            
+            # Compute violation metrics by algorithm × PCS
+            metrics_df = self.compute_violation_metrics(df)
+            
+            if metrics_df.empty:
+                print("❌ No metrics computed!")
+                return
+            
+            # Generate comparison tables
+            algo_table = self.compute_algo_comparison_table(metrics_df, per_pcs=False)
+            pcs_table = self.compute_algo_comparison_table(metrics_df, per_pcs=True)
+            
+            # Save CSV outputs
+            metrics_df.to_csv(self.tables_dir / 'violations_by_algo_pcs.csv', index=False)
+            algo_table.to_csv(self.tables_dir / 'algo_comparison_table.csv', index=False)
+            if self.per_pcs:
+                pcs_table.to_csv(self.tables_dir / 'algo_pcs_comparison_table.csv', index=False)
+            
+            # Generate enhanced plots
+            print("📈 Generating Enhanced Plots...")
+            
+            # PCS analysis plots
+            self.plot_algo_pcs_heatmap(metrics_df, self.plots_dir / 'pcs_heatmap.png')
+            self.plot_cost_reward_scatter(metrics_df, self.plots_dir / 'cost_reward_scatter.png')
+            self.plot_algo_pcs_line(metrics_df, self.plots_dir / 'pcs_line_plot.png')
+            
+            # Per-algorithm PCS reports
+            for algo in self.algorithms:
+                self.plot_per_algo_pcs(metrics_df, algo, self.plots_dir)
+            
+            # Generate modified composite plot (replace pass-rate panels)
+            self.generate_enhanced_composite(df, metrics_df)
+            
+            # Console summary
+            print("\n" + "=" * 60)
+            print("=== Algorithm × PCS (cost-centric) ===")
+            print("=" * 60)
+            print(f"{'Algorithm':<12} {'PCS':<20} {'AvgCost':<8} {'CI95':<6} {'Shortfall%':<10} {'Freq%':<6} {'SOC%':<6} {'Rank':<4}")
+            print("-" * 80)
+            
+            for _, row in metrics_df.iterrows():
+                print(f"{row['algorithm']:<12} {row['pcs_mode']:<20} "
+                      f"{row['avg_cost_mean']:<8.3f} {row['avg_cost_ci95']:<6.3f} "
+                      f"{row['shortfall_rate']*100:<10.2f} {row['freq_rate']*100:<6.2f} "
+                      f"{row['soc_rate']*100:<6.2f} #{row['rank_by_cost']:<3}")
+            
+        else:
+            # Legacy analysis pipeline
+            metrics_df = self.calculate_metrics(df)
+            self.generate_plots(df, metrics_df)
+            self.generate_report(df, metrics_df)
+            
+            # Print legacy summary
+            if not metrics_df.empty:
+                print("\nTop 3 Algorithms:")
+                for i, (_, row) in enumerate(metrics_df.head(3).iterrows(), 1):
+                    cost_mean = row.get('cost_mean', row.get('avg_cost_mean', np.nan))
+                    reward_mean = row.get('reward_mean', row.get('avg_reward_mean', np.nan))
+                    pass_rate = row.get('pass_rate_mean', 0)
+                    print(f"{i}. {row['algorithm']}: Pass Rate={pass_rate:.1%}, "
+                          f"Cost={cost_mean:.3f}, Reward={reward_mean:.2f}")
         
         print(f"\n📁 All results saved to: {self.output_dir}/")
 
@@ -698,6 +1124,12 @@ Examples:
                        help='Force fresh evaluation (ignore cached results) - DEFAULT: True')
     parser.add_argument('--use-cache', action='store_true', default=False,
                        help='Use cached evaluation results if available (opposite of --force-reeval)')
+    parser.add_argument('--enhanced-analysis', action='store_true', default=False,
+                       help='Enable enhanced PCS and cost-centric analysis')
+    parser.add_argument('--episodes', type=int, default=10,
+                       help='Number of episodes for evaluation')
+    parser.add_argument('--per-pcs', action='store_true', default=False,
+                       help='Generate per-PCS algorithm comparison table')
     
     args = parser.parse_args()
     
@@ -711,7 +1143,10 @@ Examples:
         algorithms=args.algorithms,
         pcs_modes=args.pcs_modes,
         suites=args.suites,
-        force_reeval=force_reeval
+        force_reeval=force_reeval,
+        enhanced_analysis=args.enhanced_analysis,
+        episodes=args.episodes,
+        per_pcs=args.per_pcs
     )
     
     analyzer.run_analysis()
