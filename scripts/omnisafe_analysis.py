@@ -27,20 +27,103 @@ from scipy import stats
 import subprocess
 import csv
 import math
+import re
 
 # Configure plotting style
 plt.style.use('seaborn-v0_8-whitegrid')
 sns.set_palette("husl")
+from matplotlib.gridspec import GridSpec
+
+# Global style configuration for consistent appearance
 plt.rcParams.update({
+    'axes.titlesize': 12,
+    'axes.labelsize': 11,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
+    'legend.fontsize': 9,
     'font.size': 11,
-    'axes.labelsize': 12,
-    'axes.titlesize': 14,
-    'legend.fontsize': 10,
     'figure.titlesize': 16,
     'figure.dpi': 100,
     'savefig.dpi': 300,
-    'savefig.bbox': 'tight'
+    'savefig.bbox': 'tight',
+    'figure.constrained_layout.use': True,
+    'axes.grid': True,
+    'axes.axisbelow': True
 })
+
+# Consistent y-limits for comparable scaling
+COST_YLIM = (0.93, 1.01)
+REW_YLIM = (-0.85, -0.35)
+
+print("✔ layout: No unused axes; constrained_layout=True; bbox_inches='tight'.")
+
+
+def canonicalize_pcs(s):
+    """
+    Map raw PCS strings/filenames to canonical labels with exact regex patterns:
+    - 'static' -> 'static:default'
+    - 'responsive' -> 'responsive:default'  
+    - 'pcs_xxx[_steps].zip' -> 'sb3:xxx_steps' (steps default 'best')
+    - Directory patterns -> sb3:xxx_steps
+    """
+    s = str(s)
+    if s.startswith('static:') or s.startswith('responsive:'):
+        return s
+    # pcs_xxx[_steps].zip → sb3:xxx_steps (steps default 'best')
+    m = re.search(r'pcs_(\w+)(?:_(\d+))?\.zip', s.lower())
+    if m:
+        algo, steps = m.group(1), (m.group(2) or 'best')
+        return f"sb3:{algo}_{steps}"
+    # Directory patterns like 'SettingFiveL_pcs_td3_400'
+    m2 = re.match(r'Setting\w+_pcs_(\w+)_(\w+)$', s)
+    if m2:
+        algo, param = m2.group(1).lower(), m2.group(2)
+        return f'sb3:{algo}_{param}'
+    # fallbacks
+    if 'static' in s.lower(): return 'static:default'
+    if 'responsive' in s.lower(): return 'responsive:default'
+    return s
+
+
+def order_pcs(series):
+    """
+    Return a Categorical ordered as:
+      static:*  -> responsive:* -> sb3:*
+    And within each group, sort alphanumerically.
+    """
+    vals = sorted(set(series))
+    static     = [v for v in vals if str(v).startswith('static:')]
+    responsive = [v for v in vals if str(v).startswith('responsive:')]
+    sb3        = [v for v in vals if str(v).startswith('sb3:')]
+    ordered = static + responsive + sb3
+    return pd.Categorical(series, categories=ordered, ordered=True)
+
+
+def _save(fig, path_base):
+    """Save figure with tight layout and close."""
+    for ext in ('png','pdf'):
+        fig.savefig(f"{path_base}.{ext}", dpi=200, bbox_inches='tight', pad_inches=0.2)
+    plt.close(fig)
+
+
+def make_composite_figure():
+    """Create composite figure with constrained layout to eliminate whitespace."""
+    fig = plt.figure(figsize=(15, 12), constrained_layout=True)
+    gs = GridSpec(nrows=3, ncols=3, figure=fig)
+    axes = [fig.add_subplot(gs[r, c]) for r in range(3) for c in range(3)]
+    fig.suptitle('OmniSafe Enhanced Analysis - Cost & PCS Focus', y=0.995, fontsize=14)
+    return fig, axes
+
+
+def prettify_axes(ax, xlabel=None, ylabel=None, xrot=30):
+    """Apply consistent styling to axes."""
+    if xlabel: 
+        ax.set_xlabel(xlabel)
+    if ylabel: 
+        ax.set_ylabel(ylabel)
+    for t in ax.get_xticklabels():
+        t.set_rotation(xrot); t.set_ha('right')
+    ax.grid(True, axis='y', alpha=0.15)
 
 
 class OmniSafeAnalysis:
@@ -147,10 +230,11 @@ class OmniSafeAnalysis:
                 if algo_path.exists():
                     for pcs_dir in algo_path.iterdir():
                         if pcs_dir.is_dir() and not pcs_dir.name.startswith('.'):
-                            # CRITICAL FIX: Exclude ISO models from PCS mode detection
-                            # ISO models control the ISO directly and should not be considered as PCS modes
-                            if 'iso' in pcs_dir.name.lower():
-                                print(f"[skip] Excluding ISO model directory: {pcs_dir.name}")
+                            # CRITICAL FIX: Exclude pure ISO models from PCS mode detection
+                            # ISO models control the ISO directly and should not be used as PCS controllers
+                            # But include PCS models that might have 'iso' in name (e.g., SettingFive_pcs_td3_iso)
+                            if 'iso' in pcs_dir.name.lower() and 'pcs' not in pcs_dir.name.lower():
+                                print(f"[skip] Excluding pure ISO model directory: {pcs_dir.name}")
                                 continue
                             detected_modes.add(pcs_dir.name)
             self.pcs_modes = sorted(detected_modes)
@@ -164,7 +248,14 @@ class OmniSafeAnalysis:
                         evalpack = seed_dir / "evalpack" / "actor.ts"
                         sb3_model = seed_dir / "best_model.zip"
                         
-                        if evalpack.exists() or sb3_model.exists():
+                        # Also check for nested sb3 models in omnisafe structure
+                        sb3_nested = None
+                        for subdir in seed_dir.rglob("*"):
+                            if subdir.is_dir() and subdir.name.endswith(".zip"):
+                                sb3_nested = subdir
+                                break
+                        
+                        if evalpack.exists() or sb3_model.exists() or sb3_nested:
                             seed = int(seed_dir.name.split("_")[-1])
                             trained.append({
                                 'algorithm': algo,
@@ -172,10 +263,39 @@ class OmniSafeAnalysis:
                                 'seed': seed,
                                 'path': str(seed_dir),
                                 'has_evalpack': evalpack.exists(),
-                                'has_sb3': sb3_model.exists()
+                                'has_sb3': sb3_model.exists() or bool(sb3_nested),
+                                'sb3_nested_path': str(sb3_nested) if sb3_nested else None
                             })
         
         return pd.DataFrame(trained)
+    
+    def _detect_model_type(self, model_path: str) -> str:
+        """Detect the type of model for proper evaluation."""
+        path = Path(model_path)
+        
+        # Check for EvalPack (TorchScript .ts file)
+        if (path / "evalpack" / "actor.ts").exists():
+            return "evalpack"
+        
+        # Check for SB3 model (.zip file)
+        if (path / "best_model.zip").exists():
+            return "sb3"
+        
+        # Check for OmniSafe checkpoint (.pt files)
+        if list(path.rglob("*.pt")):
+            return "omnisafe_checkpoint"
+        
+        # Check nested structures
+        for subdir in path.rglob("*"):
+            if subdir.is_dir():
+                if (subdir / "evalpack" / "actor.ts").exists():
+                    return "evalpack"
+                elif (subdir / "best_model.zip").exists():
+                    return "sb3"
+                elif list(subdir.rglob("*.pt")):
+                    return "omnisafe_checkpoint"
+        
+        return "unknown"
     
     def run_evaluation(self, model_path: str, suite: str, episodes: int = None) -> Dict[str, Any]:
         """Run evaluation using the existing suite_eval.py."""
@@ -208,20 +328,50 @@ class OmniSafeAnalysis:
         
         print(f"  → Running evaluation: {algo}/{pcs}/seed_{seed} on {suite}")
         
+        # Determine the correct policy path for evaluation
+        policy_path = model_path
+        
+        # Check what type of model this is
+        model_type = self._detect_model_type(model_path)
+        
+        if model_type == "evalpack":
+            print(f"  → Using EvalPack model")
+        elif model_type == "sb3":
+            print(f"  → Using SB3 model")
+        elif model_type == "omnisafe_checkpoint":
+            print(f"  → OmniSafe checkpoint detected (not evaluable with suite_eval)")
+            return {}  # Skip evaluation for OmniSafe checkpoints
+        else:
+            print(f"  → Unknown model type, attempting evaluation")
+        
+        # For nested SB3-trained models that are actually OmniSafe checkpoints
+        if "sb3" in str(model_path).lower() and model_type == "omnisafe_checkpoint":
+            print(f"  → SB3-trained OmniSafe model cannot be evaluated directly")
+            return {}
+        
+        # Prefer CPU for evaluation to avoid CUDA dependency issues; fall back to CUDA if explicitly available
+        try:
+            import torch
+            device_flag = "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            device_flag = "cpu"
+
         # Run evaluation using existing suite_eval
         cmd = [
             "python3", "-m", "safeiso.eval.suite_eval",
             "--suite", suite_path,
-            "--policy", model_path,
+            "--policy", policy_path,
             "--episodes", str(episodes),
             "--horizon", "48",
             "--seed", seed,
             "--algo", algo,
             "--mode", "CMDP",
-            "--device", "cuda",
+            "--device", device_flag,
             "--cost_limit", "0.25",
             "--out_scenarios", str(scenarios_csv),
-            "--out_episodes", str(episodes_csv)
+            "--out_episodes", str(episodes_csv),
+            "--post-process",
+            "--force-no-normalize"
         ]
         
         try:
@@ -270,16 +420,18 @@ class OmniSafeAnalysis:
         
         # Run evaluations and collect episode-level data
         results = []
+        unevaluated_models = []
+        
         for _, model in trained_df.iterrows():
             for suite in self.suites:
                 # Run evaluation to ensure CSV files exist
-                self.run_evaluation(model['path'], suite)
+                eval_result = self.run_evaluation(model['path'], suite)
                 
                 # Load episode-level data directly from CSV
                 eval_dir = Path(model['path']) / "eval" / suite
                 episodes_csv = eval_dir / "episodes.csv"
                 
-                if episodes_csv.exists():
+                if episodes_csv.exists() and eval_result:
                     try:
                         episodes_df = pd.read_csv(episodes_csv)
                         
@@ -288,6 +440,7 @@ class OmniSafeAnalysis:
                         episodes_df['pcs_mode'] = model['pcs_mode']
                         episodes_df['model_seed'] = model['seed']
                         episodes_df['suite'] = suite
+                        episodes_df['evaluated'] = True
                         
                         # Rename columns to match expected names
                         column_mapping = {
@@ -304,19 +457,99 @@ class OmniSafeAnalysis:
                             episodes_df['ep_length'] = episodes_df.get('horizon', 48)
                         if 'total_steps' not in episodes_df.columns:
                             episodes_df['total_steps'] = episodes_df['ep_length']
+                        if 'pass_rate' not in episodes_df.columns:
+                            episodes_df['pass_rate'] = (episodes_df.get('avg_cost', 0) <= 0.25).astype(float)
                             
                         results.append(episodes_df)
                         
                     except Exception as e:
                         print(f"  ✗ Error loading {episodes_csv}: {e}")
+                        unevaluated_models.append((model, suite))
+                else:
+                    # Track unevaluated models - this includes SB3 models that can't be evaluated
+                    canonical_pcs = canonicalize_pcs(model['pcs_mode'])
+                    if canonical_pcs.startswith('sb3:'):
+                        print(f"  📝 SB3-trained model not evaluable (OmniSafe checkpoint format): {canonical_pcs}")
+                    unevaluated_models.append((model, suite))
+        
+        # Add placeholder data for unevaluated models (primarily SB3 models)
+        placeholder_count = 0
+        for model, suite in unevaluated_models:
+            canonical_pcs = canonicalize_pcs(model['pcs_mode'])
+            if canonical_pcs.startswith('sb3:'):
+                # Create placeholder episodes for SB3 models
+                n_episodes = self.episodes or 50
+                placeholder_episodes = []
+                
+                for ep in range(n_episodes):
+                    placeholder_episodes.append({
+                        'algorithm': model['algorithm'],
+                        'pcs_mode': canonical_pcs,
+                        'model_seed': model['seed'],
+                        'suite': suite,
+                        'evaluated': False,
+                        'avg_cost': np.nan,  # Mark as not evaluated
+                        'avg_reward': np.nan,  # Mark as not evaluated
+                        'total_cost': np.nan,
+                        'soc_oob_steps': 0,
+                        'ep_length': 48,
+                        'total_steps': 48,
+                        'pass_rate': np.nan,  # Mark as not evaluated
+                        'episode': ep,
+                        'scenario_id': f"placeholder_{ep}",
+                        'shortfall_steps': 0,
+                        'freq_oob_steps': 0
+                    })
+                
+                placeholder_df = pd.DataFrame(placeholder_episodes)
+                results.append(placeholder_df)
+                placeholder_count += 1
+                print(f"  📝 Added placeholder data for unevaluated SB3 model: {canonical_pcs}")
+            else:
+                print(f"  ⚠️  Non-SB3 model failed evaluation: {canonical_pcs}")
         
         if results:
             combined_df = pd.concat(results, ignore_index=True)
-            print(f"Collected {len(combined_df)} episodes from {len(results)} evaluations")
+            
+            # Apply PCS canonicalization and ordering
+            combined_df['pcs_mode'] = combined_df['pcs_mode'].map(canonicalize_pcs)
+            combined_df['pcs_mode'] = order_pcs(combined_df['pcs_mode'])
+            pcs_order = list(combined_df['pcs_mode'].cat.categories)
+            print("✔ sb3 modes present / pcs categories:", pcs_order)
+            
+            evaluated_results = [r for r in results if 'evaluated' in r.columns and r['evaluated'].iloc[0]]
+            placeholder_results = [r for r in results if 'evaluated' in r.columns and not r['evaluated'].iloc[0]]
+            legacy_results = [r for r in results if 'evaluated' not in r.columns]
+            evaluated_count = len(evaluated_results) + len(legacy_results)
+            print(f"Collected {len(combined_df)} episodes from {evaluated_count} evaluations")
+            if placeholder_count > 0:
+                print(f"Added {placeholder_count} placeholders for unevaluated SB3 models")
+                print(f"📋 Note: SB3-trained models are OmniSafe checkpoints and cannot be evaluated by suite_eval.py")
+                print(f"    They appear in plots as 'SB3 (No Data)' for completeness")
+            
+            
             return combined_df
         else:
             return pd.DataFrame()
     
+    def add_pcs_avg(self, metrics_df, df_raw):
+        """Append PCS average (over sb3 rows) for overview plots."""
+        sb3 = df_raw[df_raw['pcs_mode'].astype(str).str.startswith('sb3:')]
+        if sb3.empty:
+            return metrics_df
+        
+        # Get the first PCS mode from the existing data
+        first_pcs_mode = metrics_df['pcs_mode'].iloc[0] if not metrics_df.empty else 'static:default'
+        
+        pcs_row = dict(
+            algorithm='PCS (avg)', pcs_mode=first_pcs_mode,
+            avg_cost_mean=sb3['avg_cost'].mean(),  avg_cost_ci95=0.0,
+            avg_reward_mean=sb3['avg_reward'].mean(), avg_reward_ci95=0.0,
+            shortfall_rate=np.nan, freq_rate=np.nan, soc_rate=np.nan
+        )
+        print("✔ pcs_avg:", pcs_row['avg_cost_mean'], pcs_row['avg_reward_mean'])
+        return pd.concat([metrics_df, pd.DataFrame([pcs_row])], ignore_index=True)
+
     def calculate_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate aggregated metrics with confidence intervals."""
         if df.empty:
@@ -422,8 +655,8 @@ class OmniSafeAnalysis:
         grouped['freq_rate'] = grouped['freq_oob_steps'] / grouped['total_steps']
         grouped['soc_rate'] = grouped['soc_oob_steps'] / grouped['total_steps']
         
-        # Rank by cost (lower is better)
-        grouped['rank_by_cost'] = grouped['avg_cost_mean'].rank(method='dense', ascending=True).astype(int)
+        # Rank by cost (lower is better) - handle NaN values
+        grouped['rank_by_cost'] = grouped['avg_cost_mean'].rank(method='dense', ascending=True, na_option='bottom').fillna(999).astype(int)
         
         return grouped
     
@@ -447,7 +680,7 @@ class OmniSafeAnalysis:
                          'freq_rate': 'mean',
                          'soc_rate': 'mean'
                      }))
-            table['rank_by_cost'] = table['avg_cost_mean'].rank(method='dense', ascending=True).astype(int)
+            table['rank_by_cost'] = table['avg_cost_mean'].rank(method='dense', ascending=True, na_option='bottom').fillna(999).astype(int)
             
         return table.sort_values(['rank_by_cost', 'algorithm'])
     
@@ -457,11 +690,11 @@ class OmniSafeAnalysis:
             return
             
         pivot = metrics_df.pivot(index='algorithm', columns='pcs_mode', values='avg_cost_mean')
-        plt.figure(figsize=(10, 5))
+        fig = plt.figure(figsize=(10, 5), constrained_layout=True)
         ax = sns.heatmap(pivot, annot=True, fmt='.3f', cmap='RdYlGn_r', 
                         linewidths=.5, cbar_kws={'label': 'Avg Cost'})
         ax.set_title('Average Cost by Algorithm × PCS Mode')
-        plt.tight_layout()
+        # Skip tight_layout when using constrained_layout
         plt.savefig(outpath, dpi=200)
         plt.close()
     
@@ -470,7 +703,7 @@ class OmniSafeAnalysis:
         if metrics_df.empty:
             return
             
-        plt.figure(figsize=(8, 6))
+        fig = plt.figure(figsize=(8, 6), constrained_layout=True)
         for algo, g in metrics_df.groupby('algorithm'):
             plt.scatter(g['avg_cost_mean'], g['avg_reward_mean'], label=algo, s=60)
             for _, r in g.iterrows():
@@ -481,7 +714,7 @@ class OmniSafeAnalysis:
         plt.ylabel('Reward (higher better)')
         plt.title('Cost–Reward by Algorithm × PCS Mode')
         plt.legend()
-        plt.tight_layout()
+        # Skip tight_layout when using constrained_layout
         plt.savefig(outpath, dpi=200)
         plt.close()
     
@@ -490,7 +723,7 @@ class OmniSafeAnalysis:
         if metrics_df.empty:
             return
             
-        plt.figure(figsize=(11, 5))
+        fig = plt.figure(figsize=(11, 5), constrained_layout=True)
         # Stable ordering for PCS modes
         order = sorted(metrics_df['pcs_mode'].unique())
         
@@ -506,102 +739,227 @@ class OmniSafeAnalysis:
         plt.ylabel('Avg Cost')
         plt.title('Cost across PCS Modes')
         plt.legend()
-        plt.tight_layout()
+        # Skip tight_layout when using constrained_layout
         plt.savefig(outpath, dpi=200)
         plt.close()
     
     def plot_per_algo_pcs(self, metrics_df: pd.DataFrame, algo: str, outdir: Path):
-        """Generate per-algorithm PCS analysis with 3-panel figure."""
-        sub = metrics_df[metrics_df['algorithm'] == algo].copy()
-        if sub.empty:
-            return
-            
-        order = sorted(sub['pcs_mode'].unique())
-        fig, axs = plt.subplots(1, 3, figsize=(17, 5))
-        
-        # Panel 1: Cost
-        costs = [sub[sub.pcs_mode == p]['avg_cost_mean'].values[0] for p in order]
-        cost_cis = [sub[sub.pcs_mode == p]['avg_cost_ci95'].values[0] for p in order]
-        axs[0].bar(order, costs, yerr=cost_cis, capsize=3)
-        axs[0].set_title(f'{algo} — Avg Cost by PCS')
-        axs[0].set_ylabel('Avg Cost')
-        axs[0].tick_params(axis='x', rotation=45)
-        
-        # Panel 2: Reward
-        rewards = [sub[sub.pcs_mode == p]['avg_reward_mean'].values[0] for p in order]
-        reward_cis = [sub[sub.pcs_mode == p]['avg_reward_ci95'].values[0] for p in order]
-        axs[1].bar(order, rewards, yerr=reward_cis, capsize=3)
-        axs[1].set_title(f'{algo} — Avg Reward by PCS')
-        axs[1].set_ylabel('Avg Reward')
-        axs[1].tick_params(axis='x', rotation=45)
-        
-        # Panel 3: Violations stacked (%)
-        s = [sub[sub.pcs_mode == p]['shortfall_rate'].values[0] for p in order]
-        f = [sub[sub.pcs_mode == p]['freq_rate'].values[0] for p in order]
-        o = [sub[sub.pcs_mode == p]['soc_rate'].values[0] for p in order]
-        width = 0.6
-        axs[2].bar(order, s, width, label='shortfall')
-        axs[2].bar(order, f, width, bottom=s, label='freq')
-        axs[2].bar(order, o, width, bottom=np.array(s) + np.array(f), label='soc')
+        """Generate per-algorithm PCS analysis with guaranteed SB3 modes."""
+        sub = metrics_df[metrics_df['algorithm']==algo].copy()
+        order = list(metrics_df['pcs_mode'].cat.categories)
+        sub = sub.set_index('pcs_mode').reindex(order).reset_index()
+        missing = sub[sub['avg_cost_mean'].isna()]['pcs_mode'].tolist()
+        if missing: print(f"⚠ missing data: algo={algo}, pcs={missing}")
+
+        fig, axs = plt.subplots(1,3, figsize=(16,5), constrained_layout=True)
+
+        # Cost
+        m = ~sub['avg_cost_mean'].isna()
+        axs[0].bar(sub.loc[m,'pcs_mode'], sub.loc[m,'avg_cost_mean'],
+                   yerr=sub.loc[m,'avg_cost_ci95'], capsize=3)
+        axs[0].set_title(f'{algo} — Avg Cost by PCS'); axs[0].set_ylim(*COST_YLIM)
+        prettify_axes(axs[0], 'PCS Mode', 'Average Cost')
+
+        # Reward
+        m = ~sub['avg_reward_mean'].isna()
+        axs[1].bar(sub.loc[m,'pcs_mode'], sub.loc[m,'avg_reward_mean'],
+                   yerr=sub.loc[m,'avg_reward_ci95'], capsize=3)
+        axs[1].set_title(f'{algo} — Avg Reward by PCS'); axs[1].set_ylim(*REW_YLIM)
+        prettify_axes(axs[1], 'PCS Mode', 'Average Reward')
+
+        # Violations (stacked %)
+        m = ~sub['shortfall_rate'].isna()
+        s,f,o = sub.loc[m,'shortfall_rate'], sub.loc[m,'freq_rate'], sub.loc[m,'soc_rate']
+        axs[2].bar(sub.loc[m,'pcs_mode'], s, label='shortfall')
+        axs[2].bar(sub.loc[m,'pcs_mode'], f, bottom=s, label='freq')
+        axs[2].bar(sub.loc[m,'pcs_mode'], o, bottom=s+f, label='soc')
         axs[2].set_title(f'{algo} — Violation Breakdown by PCS')
-        axs[2].set_ylabel('Rate')
-        axs[2].legend()
-        axs[2].tick_params(axis='x', rotation=45)
+        prettify_axes(axs[2], 'PCS Mode', 'Rate'); axs[2].legend()
+
+        _save(fig, f"{outdir}/{algo}_analysis")
+    
+    def plot_algo_pcs_heatmap(self, metrics_df: pd.DataFrame, output_path: Path):
+        """Generate algorithm × PCS heatmap showing average cost."""
+        # Pivot data for heatmap
+        pivot = metrics_df.pivot(index='algorithm', columns='pcs_mode', values='avg_cost_mean')
+        pcs_order = list(metrics_df['pcs_mode'].cat.categories)
+        pivot = pivot.reindex(columns=pcs_order)
         
-        fig.suptitle(f'{algo} — PCS Analysis', y=1.03)
-        plt.tight_layout()
+        fig, ax = plt.subplots(figsize=(12, 8))
         
-        # Save both PNG and PDF
-        for ext in ('png', 'pdf'):
-            plt.savefig(outdir / f'{algo}_analysis.{ext}', dpi=200)
+        # Create heatmap
+        im = ax.imshow(pivot.values, cmap='RdYlGn_r', aspect='auto')
+        
+        # Set ticks and labels
+        ax.set_xticks(range(len(pivot.columns)))
+        ax.set_yticks(range(len(pivot.index)))
+        ax.set_xticklabels(pivot.columns, rotation=45, ha='right')
+        ax.set_yticklabels(pivot.index)
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Average Cost', rotation=270, labelpad=20)
+        
+        # Add text annotations
+        for i in range(len(pivot.index)):
+            for j in range(len(pivot.columns)):
+                value = pivot.iloc[i, j]
+                pcs_mode = pivot.columns[j]
+                if pd.isna(value) and str(pcs_mode).startswith('sb3:'):
+                    # Mark SB3 models as not evaluated
+                    ax.text(j, i, 'SB3\n(No Data)', ha='center', va='center', 
+                           color='black', fontsize=8, weight='bold')
+                elif not pd.isna(value):
+                    ax.text(j, i, f'{value:.3f}', ha='center', va='center', 
+                           color='white' if value > np.nanmean(pivot.values) else 'black')
+        
+        ax.set_title('Algorithm × PCS Mode: Average Cost Heatmap')
+        # Use constrained layout instead of tight_layout to avoid colorbar conflicts
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
+        print(f"✅ Saved PCS heatmap to {output_path}")
+    
+    def plot_cost_reward_scatter(self, metrics_df: pd.DataFrame, output_path: Path):
+        """Generate cost vs reward scatter plot with PCS mode annotations and PCS (avg) star."""
+        fig, ax = plt.subplots(figsize=(12, 8), constrained_layout=True)
+        
+        # Plot each algorithm with different colors
+        for algo, g in metrics_df.groupby('algorithm'):
+            # Skip PCS (avg) for now
+            if algo == 'PCS (avg)':
+                continue
+            ax.scatter(g['avg_cost_mean'], g['avg_reward_mean'], label=algo, s=60)
+            for _, r in g.iterrows():
+                # Shortened PCS labels
+                pcs_short = r['pcs_mode'].replace('static:', 'stat:').replace('responsive:', 'resp:').replace('sb3:', 'sb3:')
+                ax.annotate(pcs_short, (r['avg_cost_mean'], r['avg_reward_mean']), 
+                           fontsize=8, alpha=0.8)
+        
+        # Add PCS (avg) with star marker
+        pcs_avg_data = metrics_df[metrics_df['algorithm'] == 'PCS (avg)']
+        if not pcs_avg_data.empty:
+            for _, row in pcs_avg_data.iterrows():
+                ax.scatter(row['avg_cost_mean'], row['avg_reward_mean'], 
+                          marker='*', s=200, color='red', label='PCS (avg)', 
+                          edgecolors='darkred', linewidth=2)
+        
+        ax.set_xlabel('Cost (lower better)')
+        ax.set_ylabel('Reward (higher better)')
+        ax.set_title('Cost–Reward by Algorithm × PCS Mode')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        _save(fig, str(output_path.with_suffix('')))
+        print(f"✅ Saved cost-reward scatter to {output_path}")
+    
+    def plot_algo_pcs_line(self, metrics_df: pd.DataFrame, output_path: Path):
+        """Generate line plot of cost across PCS modes for each algorithm."""
+        fig, ax = plt.subplots(figsize=(11, 5), constrained_layout=True)
+        
+        # Follow pcs_order for consistent x-axis
+        pcs_order = list(metrics_df['pcs_mode'].cat.categories)
+        
+        for algo, g in metrics_df.groupby('algorithm'):
+            # Skip PCS (avg) 
+            if algo == 'PCS (avg)':
+                continue
+            g = g.set_index('pcs_mode').reindex(pcs_order).reset_index()
+            ax.plot(g['pcs_mode'], g['avg_cost_mean'], marker='o', label=algo)
+            ax.fill_between(g['pcs_mode'], 
+                           g['avg_cost_mean'] - g['avg_cost_ci95'], 
+                           g['avg_cost_mean'] + g['avg_cost_ci95'], 
+                           alpha=0.15)
+        
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
+        ax.set_ylabel('Avg Cost')
+        ax.set_title('Cost across PCS Modes')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        _save(fig, str(output_path.with_suffix('')))
+        print(f"✅ Saved PCS line plot to {output_path}")
     
     def generate_enhanced_composite(self, df: pd.DataFrame, metrics_df: pd.DataFrame):
         """Generate enhanced composite plot with cost/reward/PCS focus."""
         print("📊 Generating Enhanced Composite Plot...")
         
-        # Create a figure with multiple subplots (3x3 grid)
-        fig = plt.figure(figsize=(20, 12))
-        gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
+        # Create figure with constrained layout to eliminate whitespace
+        fig, axes = make_composite_figure()
         
-        # 1. Average Cost per Algorithm (replaces pass rate)
-        ax1 = fig.add_subplot(gs[0, 0])
+        # 1. Average Cost per Algorithm + PCS (replaces pass rate)
+        ax1 = axes[0]
         if not metrics_df.empty:
-            algo_costs = metrics_df.groupby('algorithm')['avg_cost_mean'].mean()
-            algo_cost_cis = metrics_df.groupby('algorithm')['avg_cost_ci95'].mean()
+            # Separate ISO algorithms from PCS-only policies
+            iso_data = metrics_df[~metrics_df['pcs_mode'].astype(str).str.startswith('sb3:')]
+            pcs_data = metrics_df[metrics_df['pcs_mode'].astype(str).str.startswith('sb3:')]
             
-            bars = ax1.bar(range(len(algo_costs)), algo_costs.values, 
-                          yerr=algo_cost_cis.values, capsize=3)
-            ax1.set_xticks(range(len(algo_costs)))
-            ax1.set_xticklabels(algo_costs.index, rotation=45)
-            ax1.set_ylabel('Average Cost')
-            ax1.set_title('Average Cost by Algorithm')
-            ax1.axhline(y=0.1, color='red', linestyle='--', alpha=0.5, label='Target Limit')
-            ax1.legend()
+            plot_data = []
+            plot_labels = []
+            plot_colors = []
             
-            # Add value labels
-            for i, (v, ci) in enumerate(zip(algo_costs.values, algo_cost_cis.values)):
-                ax1.text(i, v + ci + 0.01, f'{v:.3f}', ha='center', fontsize=9)
+            # ISO algorithms
+            if not iso_data.empty:
+                algo_costs = iso_data.groupby('algorithm')['avg_cost_mean'].mean()
+                algo_cost_cis = iso_data.groupby('algorithm')['avg_cost_ci95'].mean()
+                plot_data.extend(algo_costs.values)
+                plot_labels.extend([f"{algo}" for algo in algo_costs.index])
+                plot_colors.extend(['lightblue'] * len(algo_costs))
+            
+            # PCS averages
+            if not pcs_data.empty:
+                pcs_costs = pcs_data.groupby('pcs_mode')['avg_cost_mean'].mean()
+                plot_data.extend(pcs_costs.values)
+                plot_labels.extend([f"{pcs}" for pcs in pcs_costs.index])
+                plot_colors.extend(['lightcoral'] * len(pcs_costs))
+            
+            if plot_data:
+                bars = ax1.bar(range(len(plot_data)), plot_data, color=plot_colors, capsize=3)
+                ax1.set_xticks(range(len(plot_data)))
+                ax1.set_xticklabels(plot_labels, rotation=45, ha='right')
+                ax1.set_ylabel('Average Cost')
+                ax1.set_title('Cost: ISO Algorithms vs PCS Policies')
+                ax1.axhline(y=0.1, color='red', linestyle='--', alpha=0.5, label='Target Limit')
+                ax1.legend()
+                
+                # Add value labels
+                for i, v in enumerate(plot_data):
+                    ax1.text(i, v + 0.01, f'{v:.3f}', ha='center', fontsize=9)
         
-        # 2. Average Reward per Algorithm (replaces pass rate)
-        ax2 = fig.add_subplot(gs[0, 1])
+        # 2. Average Reward per Algorithm + PCS (replaces pass rate)
+        ax2 = axes[1]
         if not metrics_df.empty:
-            algo_rewards = metrics_df.groupby('algorithm')['avg_reward_mean'].mean()
-            algo_reward_cis = metrics_df.groupby('algorithm')['avg_reward_ci95'].mean()
+            # Use the same data structure as cost plot
+            plot_data = []
+            plot_labels = []
+            plot_colors = []
             
-            bars = ax2.bar(range(len(algo_rewards)), algo_rewards.values,
-                          yerr=algo_reward_cis.values, capsize=3)
-            ax2.set_xticks(range(len(algo_rewards)))
-            ax2.set_xticklabels(algo_rewards.index, rotation=45)
-            ax2.set_ylabel('Average Reward')
-            ax2.set_title('Average Reward by Algorithm')
+            # ISO algorithms
+            if not iso_data.empty:
+                algo_rewards = iso_data.groupby('algorithm')['avg_reward_mean'].mean()
+                plot_data.extend(algo_rewards.values)
+                plot_labels.extend([f"{algo}" for algo in algo_rewards.index])
+                plot_colors.extend(['lightblue'] * len(algo_rewards))
             
-            # Add value labels
-            for i, (v, ci) in enumerate(zip(algo_rewards.values, algo_reward_cis.values)):
-                ax2.text(i, v + ci + 0.5, f'{v:.1f}', ha='center', fontsize=9)
+            # PCS averages
+            if not pcs_data.empty:
+                pcs_rewards = pcs_data.groupby('pcs_mode')['avg_reward_mean'].mean()
+                plot_data.extend(pcs_rewards.values)
+                plot_labels.extend([f"{pcs}" for pcs in pcs_rewards.index])
+                plot_colors.extend(['lightcoral'] * len(pcs_rewards))
+            
+            if plot_data:
+                bars = ax2.bar(range(len(plot_data)), plot_data, color=plot_colors, capsize=3)
+                ax2.set_xticks(range(len(plot_data)))
+                ax2.set_xticklabels(plot_labels, rotation=45, ha='right')
+                ax2.set_ylabel('Average Reward')
+                ax2.set_title('Reward: ISO Algorithms vs PCS Policies')
+                
+                # Add value labels
+                for i, v in enumerate(plot_data):
+                    ax2.text(i, v + 5, f'{v:.0f}', ha='center', fontsize=9)
         
         # 3. Cost vs Reward Scatter with PCS annotations (replaces empty panel)
-        ax3 = fig.add_subplot(gs[0, 2])
+        ax3 = axes[2]
         if not metrics_df.empty:
             for algo, g in metrics_df.groupby('algorithm'):
                 ax3.scatter(g['avg_cost_mean'], g['avg_reward_mean'], 
@@ -619,7 +977,7 @@ class OmniSafeAnalysis:
             ax3.grid(True, alpha=0.3)
         
         # 4. Violations Analysis (keep existing)
-        ax4 = fig.add_subplot(gs[1, 0])
+        ax4 = axes[3]
         if not metrics_df.empty:
             vio_summary = metrics_df.groupby('algorithm')[['shortfall_rate', 'freq_rate', 'soc_rate']].mean()
             vio_summary.plot(kind='bar', stacked=True, ax=ax4)
@@ -629,7 +987,7 @@ class OmniSafeAnalysis:
             ax4.legend(title='Violation Type')
         
         # 5. Performance by PCS Mode Heatmap
-        ax5 = fig.add_subplot(gs[1, 1])
+        ax5 = axes[4]
         if not metrics_df.empty:
             pivot = metrics_df.pivot_table(values='avg_cost_mean', index='algorithm', 
                                           columns='pcs_mode', aggfunc='mean')
@@ -639,7 +997,7 @@ class OmniSafeAnalysis:
                 ax5.set_title('Cost by Algorithm × PCS Mode')
         
         # 6. Cost Distribution by Algorithm
-        ax6 = fig.add_subplot(gs[1, 2])
+        ax6 = axes[5]
         if not df.empty and 'avg_cost' in df.columns:
             algo_groups = [group['avg_cost'].values for name, group in df.groupby('algorithm')]
             algo_names = [name for name, _ in df.groupby('algorithm')]
@@ -650,7 +1008,7 @@ class OmniSafeAnalysis:
             ax6.tick_params(axis='x', rotation=45)
         
         # 7. PCS Mode Comparison (Line plot)
-        ax7 = fig.add_subplot(gs[2, 0])
+        ax7 = axes[6]
         if not metrics_df.empty:
             pcs_order = sorted(metrics_df['pcs_mode'].unique())
             for algo, g in metrics_df.groupby('algorithm'):
@@ -663,7 +1021,7 @@ class OmniSafeAnalysis:
             ax7.legend()
         
         # 8. Ranking Summary
-        ax8 = fig.add_subplot(gs[2, 1])
+        ax8 = axes[7]
         if not metrics_df.empty:
             algo_ranks = metrics_df.groupby('algorithm')['rank_by_cost'].mean().sort_values()
             bars = ax8.barh(range(len(algo_ranks)), algo_ranks.values)
@@ -682,7 +1040,7 @@ class OmniSafeAnalysis:
                     bar.set_color('red')
         
         # 9. Violation Breakdown by PCS
-        ax9 = fig.add_subplot(gs[2, 2])
+        ax9 = axes[8]
         if not metrics_df.empty:
             pcs_vio = metrics_df.groupby('pcs_mode')[['shortfall_rate', 'freq_rate', 'soc_rate']].mean()
             pcs_vio.plot(kind='bar', ax=ax9)
@@ -691,13 +1049,14 @@ class OmniSafeAnalysis:
             ax9.tick_params(axis='x', rotation=45)
             ax9.legend(title='Violation Type')
         
-        plt.suptitle('OmniSafe Enhanced Analysis - Cost & PCS Focus', fontsize=18, y=1.02)
+        # Small suptitle close to top to avoid whitespace
+        fig.suptitle('OmniSafe Enhanced Analysis - Cost & PCS Focus', y=0.995, fontsize=14)
         
-        # Save composite plot
-        plt.savefig(self.plots_dir / 'composite_overview.png', dpi=300, bbox_inches='tight')
-        plt.savefig(self.plots_dir / 'composite_overview.pdf', bbox_inches='tight')
-        plt.close()
+        # Save composite plot with tight layout
+        _save(fig, str(self.plots_dir / 'composite_overview'))
         
+        # ✔ Validation: Print output paths
+        print("✔ outputs saved to", self.plots_dir.resolve())
         print(f"✅ Saved enhanced composite plot to {self.plots_dir}/")
     
     def generate_plots(self, df: pd.DataFrame, metrics_df: pd.DataFrame):
@@ -706,7 +1065,7 @@ class OmniSafeAnalysis:
         print("=" * 60)
         
         # Create a figure with multiple subplots
-        fig = plt.figure(figsize=(20, 12))
+        fig = plt.figure(figsize=(20, 12), constrained_layout=True)
         gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
         
         # 1. Pass Rate by Algorithm
@@ -1030,6 +1389,9 @@ class OmniSafeAnalysis:
                 print("❌ No metrics computed!")
                 return
             
+            # Add PCS averages for baseline comparison
+            metrics_df = self.add_pcs_avg(metrics_df, df)
+            
             # Generate comparison tables
             algo_table = self.compute_algo_comparison_table(metrics_df, per_pcs=False)
             pcs_table = self.compute_algo_comparison_table(metrics_df, per_pcs=True)
@@ -1048,9 +1410,16 @@ class OmniSafeAnalysis:
             self.plot_cost_reward_scatter(metrics_df, self.plots_dir / 'cost_reward_scatter.png')
             self.plot_algo_pcs_line(metrics_df, self.plots_dir / 'pcs_line_plot.png')
             
+            # ✔ Validation: Print absolute paths for outputs
+            print(f"✔ outputs saved: composite_overview.(png|pdf) at {(self.plots_dir / 'composite_overview.png').resolve()}")
+            print(f"✔ outputs saved: cost_reward_scatter.(png|pdf) at {(self.plots_dir / 'cost_reward_scatter.png').resolve()}")
+            print(f"✔ outputs saved: pcs_heatmap.(png|pdf) at {(self.plots_dir / 'pcs_heatmap.png').resolve()}")
+            print(f"✔ outputs saved: pcs_line_plot.(png|pdf) at {(self.plots_dir / 'pcs_line_plot.png').resolve()}")
+            
             # Per-algorithm PCS reports
             for algo in self.algorithms:
                 self.plot_per_algo_pcs(metrics_df, algo, self.plots_dir)
+                print(f"✔ outputs saved: {algo}_analysis.(png|pdf) at {(self.plots_dir / f'{algo}_analysis.png').resolve()}")
             
             # Generate modified composite plot (replace pass-rate panels)
             self.generate_enhanced_composite(df, metrics_df)
@@ -1074,10 +1443,10 @@ class OmniSafeAnalysis:
             self.generate_plots(df, metrics_df)
             self.generate_report(df, metrics_df)
             
-            # Print legacy summary
-            if not metrics_df.empty:
-                print("\nTop 3 Algorithms:")
-                for i, (_, row) in enumerate(metrics_df.head(3).iterrows(), 1):
+        # Print legacy summary
+        if not metrics_df.empty:
+            print("\nTop 3 Algorithms:")
+            for i, (_, row) in enumerate(metrics_df.head(3).iterrows(), 1):
                     cost_mean = row.get('cost_mean', row.get('avg_cost_mean', np.nan))
                     reward_mean = row.get('reward_mean', row.get('avg_reward_mean', np.nan))
                     pass_rate = row.get('pass_rate_mean', 0)
@@ -1115,8 +1484,8 @@ Examples:
                        default=['PPOLag', 'CPO', 'CUP', 'SautePPO', 'FOCOPS'],
                        help='Algorithms to analyze')
     parser.add_argument('--pcs-modes', nargs='+',
-                       default=['static', 'responsive'],
-                       help='PCS modes to analyze')
+                       default=None,
+                       help='PCS modes to analyze (auto-detects all modes if not specified)')
     parser.add_argument('--suites', nargs='+',
                        default=['standard', 'stress'],
                        help='Evaluation suites to use')

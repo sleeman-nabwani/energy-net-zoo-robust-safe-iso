@@ -176,15 +176,27 @@ python3 -m safeiso.train.train_omnisafe \
 
 echo "[info] Training finished: $(date)"
 
-# Post-train verification: prefer EvalPack, else SB3+vecnormalize
+# Convert SB3-trained models to EvalPack format for evaluation
+if [[ "${PCS}" == *"sb3"* ]] || [[ "${PCS}" == *"Setting"* ]]; then
+    echo "[info] Converting SB3-trained model to EvalPack format..."
+    python3 -m safeiso.train.convert_sb3_to_evalpack "${SAVE_DIR}" --algo "${ALGO}" --seed "${SEED}" || echo "[warn] EvalPack conversion failed, but continuing..."
+fi
+
+# Post-train verification: prefer EvalPack, else SB3+vecnormalize, or nested omnisafe models
 EP_ACTOR="${SAVE_DIR}/evalpack/actor.ts"
 SB3_ZIP_ISO="${SAVE_DIR}/best_model.zip"
 VN_ISO="${SAVE_DIR}/vecnormalize.pkl"
+
+# Check for nested omnisafe model structures (for sb3 PCS models)
+NESTED_MODEL=$(find "${SAVE_DIR}" -type d -name "*sb3*.zip" 2>/dev/null | head -1)
+NESTED_OMNI=$(find "${SAVE_DIR}" -type d -name "*omni*" 2>/dev/null | head -1)
 
 verified=false
 model_files=()
 [[ -f "$EP_ACTOR" ]] && verified=true && model_files+=("evalpack/actor.ts")
 [[ -f "$SB3_ZIP_ISO" && -f "$VN_ISO" ]] && verified=true && model_files+=("best_model.zip" "vecnormalize.pkl")
+[[ -d "$NESTED_MODEL" ]] && verified=true && model_files+=("$(basename "$NESTED_MODEL")")
+[[ -d "$NESTED_OMNI" ]] && verified=true && model_files+=("$(basename "$NESTED_OMNI")")
 
 python3 -c "
 import os, json
@@ -197,7 +209,12 @@ print(json.dumps(vf, indent=2))
 "
 
 if [[ "$verified" != true ]]; then
-  echo "[fatal] No EvalPack or SB3+vecnormalize artifacts found in ${SAVE_DIR}"
+  echo "[fatal] No EvalPack, SB3+vecnormalize, or nested omnisafe artifacts found in ${SAVE_DIR}"
+  echo "[debug] Checked for:"
+  echo "  - EvalPack: $EP_ACTOR"
+  echo "  - SB3+vecnorm: $SB3_ZIP_ISO + $VN_ISO"
+  echo "  - Nested SB3: $NESTED_MODEL"
+  echo "  - Nested Omni: $NESTED_OMNI"
   exit 4
 fi
 

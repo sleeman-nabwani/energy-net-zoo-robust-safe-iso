@@ -265,6 +265,8 @@ def main():
             )
             close_after = True
         obs_rms = getattr(agent, "obs_rms", None)
+        
+        # Export EvalPack for the ISO agent
         export_evalpack(
             actor=actor,
             action_space=export_env.action_space,
@@ -275,12 +277,13 @@ def main():
             seed=int(args.seed),
             obs_rms=obs_rms,
         )
+        logger.info(f"[EvalPack] ISO agent exported at: {os.path.join(args.save_dir, 'evalpack')}")
         if close_after:
             try:
                 export_env.close()
             except Exception:
                 pass
-        logger.info(f"[EvalPack] Exported at: {os.path.join(args.save_dir, 'evalpack')}")
+                
     except Exception as e:
         logger.error(f"[EvalPack] Export failed: {e}")
 

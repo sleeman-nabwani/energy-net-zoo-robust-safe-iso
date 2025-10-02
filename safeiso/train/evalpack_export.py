@@ -10,6 +10,12 @@ def _to_pylist(x):
     """Return a plain Python list (or None) from numpy/torch/list/tuple/scalar."""
     if x is None:
         return None
+    # Check if x is a callable (method) and call it
+    if callable(x):
+        try:
+            x = x()
+        except Exception:
+            return None
     # torch tensor
     if hasattr(x, "detach") and hasattr(x, "cpu"):
         x = x.detach().cpu().numpy()
@@ -67,7 +73,11 @@ class _EvalWrapper(torch.nn.Module):
         
         # Extract action from various output types
         if hasattr(out, "mean"):
-            act = out.mean
+            # Handle case where mean is a method (like numpy arrays)
+            if callable(out.mean):
+                act = out.mean()
+            else:
+                act = out.mean
         elif isinstance(out, (tuple, list)):
             act = out[0]  
         else:
@@ -102,6 +112,12 @@ def export_evalpack(
     obs_mean = getattr(obs_rms, "mean", None)
     obs_var = getattr(obs_rms, "var", None)
     eps = getattr(obs_rms, "eps", 1e-8)
+    
+    # Handle case where mean/var are methods (e.g., numpy arrays)
+    if callable(obs_mean):
+        obs_mean = obs_mean()
+    if callable(obs_var):
+        obs_var = obs_var()
 
     obs_mean_list = _to_pylist(obs_mean)
     obs_var_list = _to_pylist(obs_var)

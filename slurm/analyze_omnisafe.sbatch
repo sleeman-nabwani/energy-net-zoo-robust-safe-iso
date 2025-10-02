@@ -36,7 +36,7 @@ if [[ -z "${CONDA_PREFIX:-}" && -d "venv" ]]; then source venv/bin/activate; fi
 
 # Configuration (can be overridden via environment variables)
 ALGORITHMS="${ALGORITHMS:-PPOLag CPO CUP SautePPO FOCOPS}"
-PCS_MODES="${PCS_MODES:-static responsive}"
+PCS_MODES="${PCS_MODES:-}"
 SUITES="${SUITES:-standard stress}"
 # Auto-detect latest batch or use specified one
 if [[ -n "${BATCH_ID:-}" ]]; then
@@ -108,7 +108,7 @@ if [ -n "$OUTPUT_DIR" ]; then
         --results-dir "$MODELS_DIR" \
         --output-dir "$OUTPUT_DIR" \
         --algorithms $ALGORITHMS \
-        --pcs-modes $PCS_MODES \
+        $(if [[ -n "$PCS_MODES" ]]; then echo "--pcs-modes $PCS_MODES"; fi) \
         --suites $SUITES \
         --use-cache
 else
@@ -118,7 +118,7 @@ else
         --episodes 1000 \
         --results-dir "$MODELS_DIR" \
         --algorithms $ALGORITHMS \
-        --pcs-modes $PCS_MODES \
+        $(if [[ -n "$PCS_MODES" ]]; then echo "--pcs-modes $PCS_MODES"; fi) \
         --suites $SUITES \
         --use-cache
 fi
